@@ -122,3 +122,76 @@ pub fn lines<const N: usize>(data: &[u8], start: usize, end: usize, mut f: impl 
         }
     }
 }
+
+/// Per-line variant: masks of a 128-byte window from the line start, comma
+/// positions picked with `pdep` (no data-dependent loop exits). Lines longer
+/// than 127 bytes, and lines near the end of the data, use the scalar splitter.
+#[inline(always)]
+pub fn lines_pdep<const N: usize>(data: &[u8], start: usize, end: usize, mut f: impl FnMut(&[&[u8]; N])) {
+    let n = data.len();
+    let mut p = if start == 0 {
+        match memchr::memchr(b'\n', data) {
+            Some(i) => i + 1,
+            None => return,
+        }
+    } else {
+        match memchr::memchr(b'\n', &data[start - 1..]) {
+            Some(i) => start - 1 + i + 1,
+            None => return,
+        }
+    };
+    let ptr = data.as_ptr();
+    let mut fl: [&[u8]; N] = [&[]; N];
+    while p < end && p < n {
+        if p + 128 <= n {
+            let (nl0, cm0, qt0) = unsafe { masks64(ptr.add(p)) };
+            let (nl1, cm1, qt1) = unsafe { masks64(ptr.add(p + 64)) };
+            let t0 = nl0.trailing_zeros() as usize;
+            let t1 = 64 + nl1.trailing_zeros() as usize;
+            let len = if nl0 != 0 { t0 } else { t1 };
+            if len < 128 {
+                let next = p + len + 1;
+                let (lm0, lm1) = unsafe { (_bzhi_u64(u64::MAX, len.min(64) as u32), _bzhi_u64(u64::MAX, len.saturating_sub(64) as u32)) };
+                let c0 = cm0 & lm0;
+                let c1 = cm1 & lm1;
+                let k0 = c0.count_ones() as usize;
+                if len == 0 || k0 + c1.count_ones() as usize != N - 1 {
+                    p = next;
+                    continue;
+                }
+                let q = (qt0 & lm0).count_ones() + (qt1 & lm1).count_ones();
+                let mut expect = 0u32;
+                let mut s = 0usize;
+                for i in 0..N {
+                    let e = if i == N - 1 {
+                        len
+                    } else {
+                        let a = unsafe { _pdep_u64(1u64 << (i & 63), c0) }.trailing_zeros() as usize;
+                        let b = 64 + unsafe { _pdep_u64(1u64 << (i.wrapping_sub(k0) & 63), c1) }.trailing_zeros() as usize;
+                        if i < k0 { a } else { b }
+                    };
+                    let l = e - s;
+                    let first = unsafe { *ptr.add(p + s) };
+                    let last = unsafe { *ptr.add(p + if e > 0 { e - 1 } else { 0 }) };
+                    let qf = ((l >= 2) & (first == b'"') & (last == b'"')) as usize;
+                    expect += 2 * qf as u32;
+                    fl[i] = unsafe { std::slice::from_raw_parts(ptr.add(p + s + qf), l - 2 * qf) };
+                    s = e + 1;
+                }
+                if expect == q {
+                    f(&fl);
+                }
+                p = next;
+                continue;
+            }
+        }
+        let e = match memchr::memchr(b'\n', &data[p..]) {
+            Some(i) => p + i,
+            None => n,
+        };
+        if crate::text::split::<N>(&data[p..e], &mut fl) {
+            f(&fl);
+        }
+        p = e + 1;
+    }
+}

@@ -156,6 +156,7 @@ struct Ctx {
     shift: usize,
     nparts: usize,
     scatter: bool,
+    tok_pdep: bool,
     part_cap: usize,
     exp: u32,
 }
@@ -1005,6 +1006,7 @@ struct Out {
     cnt: Vec<u32>,
     pos: Vec<u32>,
     active: Vec<u16>,
+    neg: bool, // subtract instead of add, and emit no rows (undo of an optimistic person)
 }
 
 fn process_person(ctx: &Ctx, comp: u64, evs: &[Ev], cls: &[Cl], out: &mut Out) {
@@ -1083,12 +1085,14 @@ fn process_person(ctx: &Ctx, comp: u64, evs: &[Ev], cls: &[Cl], out: &mut Out) {
         } else {
             organic
         };
+        let sg: u64 = if out.neg { u64::MAX } else { 1 };
         let a = &mut out.camp[credited * ndays + d];
-        a[0] += 1;
-        a[1] += purch as u64;
-        a[2] += rev;
+        a[0] = a[0].wrapping_add(sg);
+        a[1] = a[1].wrapping_add(sg.wrapping_mul(purch as u64));
+        a[2] = a[2].wrapping_add(sg.wrapping_mul(rev));
         for &c in &out.active {
-            out.camp[c as usize * ndays + d][3] += 1;
+            let x = &mut out.camp[c as usize * ndays + d][3];
+            *x = x.wrapping_add(sg);
         }
         i = j;
     }
@@ -1114,6 +1118,12 @@ fn flush_row(row: &mut UserRow, out: &mut Out) {
         out.cat_rev[c as usize] = 0;
     }
     out.cat_touched.clear();
+    if out.neg {
+        row.sessions = 0;
+        row.events = 0;
+        row.revenue = 0;
+        return;
+    }
     out.users.push(UserRow { comp: row.comp, day: row.day, sessions: row.sessions, events: row.events, revenue: row.revenue, top: best });
     row.sessions = 0;
     row.events = 0;
@@ -1157,16 +1167,16 @@ impl Bits {
         let h = (hash64(comp ^ 0x2545_F491_4F6C_DD1D) >> 20) & self.mask;
         ((h >> 4) as usize, ((h & 15) * 4) as u32)
     }
+    /// Sets `have`; if it was already set, sets `multi` too and returns true.
     #[inline(always)]
-    fn mark(&self, comp: u64, have: u64, multi: u64) {
-        if NOMARK.load(Relaxed) {
-            return;
-        }
+    fn mark(&self, comp: u64, have: u64, multi: u64) -> bool {
         let (i, sh) = self.at(comp);
         let old = self.w[i].fetch_or(have << sh, Relaxed);
         if old & (have << sh) != 0 {
             self.w[i].fetch_or(multi << sh, Relaxed);
+            return true;
         }
+        false
     }
     #[inline(always)]
     fn force(&self, comp: u64, bits: u64) {
@@ -1227,6 +1237,29 @@ fn decode_clicks(cl: &Dense, a: usize, b: usize, ctx: &Ctx, clbuf: &mut Vec<Cl>)
     }
 }
 
+/// Direct-mapped cache in front of the link table.
+struct CompCache {
+    k: [u64; 64],
+    v: [u64; 64],
+}
+
+impl CompCache {
+    fn new() -> Self {
+        CompCache { k: [u64::MAX; 64], v: [0; 64] }
+    }
+    #[inline(always)]
+    fn get(&mut self, links: &Links, uid: u64) -> u64 {
+        let h = (hash64(uid) >> 58) as usize;
+        if self.k[h] == uid {
+            return self.v[h];
+        }
+        let c = links.comp(uid);
+        self.k[h] = uid;
+        self.v[h] = c;
+        c
+    }
+}
+
 fn new_out(ctx: &Ctx) -> Out {
     let ncamp = ctx.camp_names.len();
     Out {
@@ -1237,11 +1270,12 @@ fn new_out(ctx: &Ctx) -> Out {
         cnt: vec![0; ncamp + 1],
         pos: vec![0; ncamp + 1],
         active: Vec::new(),
+        neg: false,
     }
 }
 
 fn write_users(path: &Path, users: &[UserRow], ctx: &Ctx, links: &Links) {
-    let n = users.len();
+    let n = users.iter().filter(|r| r.sessions != 0).count();
     let mut c_user = parquet::Column::new(names::A_ID, parquet::Kind::Str, n);
     let mut c_day = parquet::Column::new(names::DAY, parquet::Kind::Date, n);
     let mut c_s = parquet::Column::new(names::N_S, parquet::Kind::I64, n);
@@ -1250,6 +1284,9 @@ fn write_users(path: &Path, users: &[UserRow], ctx: &Ctx, links: &Links) {
     let mut c_t = parquet::Column::new(names::TOP, parquet::Kind::OptStr, n);
     let mut buf = Vec::new();
     for r in users {
+        if r.sessions == 0 {
+            continue; // removed by an undo
+        }
         uid_bytes(links.name_of(r.comp), &mut buf);
         c_user.push_str(&buf);
         c_day.push_i32(r.day);
@@ -1421,6 +1458,7 @@ fn main() {
         shift: 15,
         nparts: 0,
         scatter: false,
+        tok_pdep: std::env::var("SS_TOK").map(|v| v == "pdep").unwrap_or(false),
         part_cap: 0,
         exp: std::env::var("SS_EXP").ok().and_then(|v| v.parse().ok()).unwrap_or(0),
     };
@@ -1562,10 +1600,20 @@ fn run(
                                 }
                                 1 => {
                                     let mut c = 0usize;
-                                    scan::lines::<7>(d, a, b, |f| c += f[0].len() + f[6].len());
+                                    if ctxr.tok_pdep {
+                                        scan::lines_pdep::<7>(d, a, b, |f| c += f[0].len() + f[6].len());
+                                    } else {
+                                        scan::lines::<7>(d, a, b, |f| c += f[0].len() + f[6].len());
+                                    }
                                     std::hint::black_box(c);
                                 }
-                                _ => scan::lines::<7>(d, a, b, |f| parse_event(f, ctxr, &ev, &sc, &mut out, nt)),
+                                _ => {
+                                    if ctxr.tok_pdep {
+                                        scan::lines_pdep::<7>(d, a, b, |f| parse_event(f, ctxr, &ev, &sc, &mut out, nt))
+                                    } else {
+                                        scan::lines::<7>(d, a, b, |f| parse_event(f, ctxr, &ev, &sc, &mut out, nt))
+                                    }
+                                }
                             }
                         }
                         _ => {
@@ -1732,93 +1780,17 @@ fn run(
         }
     }
 
-    // R1: runs of each table and occupancy bits per person
+    // R1: click runs and generic rows; their bits are final before any event run is judged
     let bits = Bits::new(if ctx.pos { ((ctx.cap_e as usize / 2) / 25 * 32).next_power_of_two().clamp(1 << 20, 1 << 28) } else { 16 });
-    NOMARK.store(ctx.exp == 8, Relaxed);
-    let nparts = if ctx.pos { ctx.nparts } else { 0 };
-    let ntasks = nparts + 2 * nt;
-    let next_t = AtomicUsize::new(0);
-    let r1: Vec<(Vec<(usize, Vec<Run>)>, Vec<Vec<Entry>>)> = std::thread::scope(|s| {
+    let r1: Vec<(Vec<Run>, Vec<Vec<Entry>>)> = std::thread::scope(|s| {
         let hs: Vec<_> = (0..nt)
-            .map(|_| {
-                let (ev, cl, links, gev_kept, gcl_kept, bits, next_t, sc, spill, spill_range, outs) = (&ev, &cl, &links, &gev_kept, &gcl_kept, &bits, &next_t, &sc, &spill, &spill_range, &outs);
+            .map(|t| {
+                let (cl, links, gev_kept, gcl_kept, bits, outs) = (&cl, &links, &gev_kept, &gcl_kept, &bits, &outs);
                 s.spawn(move || {
                     let mut b: Vec<Vec<Entry>> = (0..NB).map(|_| Vec::new()).collect();
-                    let mut done: Vec<(usize, Vec<Run>)> = Vec::new();
-                    let mut cache_k = [u64::MAX; 64];
-                    let mut cache_v = [0u64; 64];
-                    let mut lookup = |uid: u64| -> u64 {
-                        let h = (hash64(uid) >> 58) as usize;
-                        if cache_k[h] == uid {
-                            return cache_v[h];
-                        }
-                        let c = links.comp(uid);
-                        cache_k[h] = uid;
-                        cache_v[h] = c;
-                        c
-                    };
-                    loop {
-                    let task = next_t.fetch_add(1, Relaxed);
-                    if task >= ntasks {
-                        break;
-                    }
-                    if task < nparts {
-                        let base = task << ctx.shift;
-                        if ctx.scatter {
-                            // place this partition: the copy with the smallest ingest wins (plain stores)
-                            let (sa, sb) = spill_range[task];
-                            for r in sc.region(task).iter().chain(spill[sa..sb].iter().map(|x| &x.1)) {
-                                let i = base + r.local as usize;
-                                let (w0s, w1) = (r.w0s, r.w1);
-                                if w0s > ev.w0(i).load(Relaxed) {
-                                    ev.w0(i).store(w0s, Relaxed);
-                                    ev.w1(i).store(w1, Relaxed);
-                                }
-                            }
-                        }
-                        let mut er: Vec<Run> = Vec::new();
-                        let lo = base.min(max_e);
-                        let hi = (base + (1 << ctx.shift)).min(max_e);
-                        let mut cur = Run { comp: u64::MAX, p: 0, a: 0, b: 0, sorted: true };
-                        let mut last_ts = 0u64;
-                        for i in lo..hi {
-                            let s0 = ev.w0(i).load(Relaxed);
-                            if s0 == 0 {
-                                continue;
-                            }
-                            let w0 = !s0;
-                            if w0 & (1 << 10) == 0 {
-                                continue;
-                            }
-                            let w1 = ev.w1(i).load(Relaxed);
-                            let uid = (w1 & (GEN_TAG - 1)) | if w0 & 8 != 0 { GEN_TAG } else { 0 };
-                            let comp = lookup(uid);
-                            let ts = (w0 >> 11) & 0x7FFF_FFFF;
-                            if comp == cur.comp {
-                                cur.b = i as u32 + 1;
-                                if ts < last_ts {
-                                    cur.sorted = false;
-                                }
-                            } else {
-                                if cur.comp != u64::MAX {
-                                    bits.mark(cur.comp, EV_HAVE, EV_MULTI);
-                                    er.push(cur);
-                                }
-                                cur = Run { comp, p: person_hint(ctx, uid), a: i as u32, b: i as u32 + 1, sorted: true };
-                            }
-                            last_ts = ts;
-                        }
-                        if cur.comp != u64::MAX {
-                            bits.mark(cur.comp, EV_HAVE, EV_MULTI);
-                            er.push(cur);
-                        }
-                        done.push((task, er));
-                    } else if task < nparts + nt {
-                        if !ctx.pos {
-                            continue;
-                        }
-                        let t = task - nparts;
-                        let mut cr: Vec<Run> = Vec::new();
+                    let mut cr: Vec<Run> = Vec::new();
+                    let mut cache = CompCache::new();
+                    if ctx.pos {
                         let lo = max_c * t / nt;
                         let hi = max_c * (t + 1) / nt;
                         let mut cur = Run { comp: u64::MAX, p: 0, a: 0, b: 0, sorted: true };
@@ -1829,7 +1801,7 @@ fn run(
                             }
                             let w1 = cl.w1(i).load(Relaxed);
                             let uid = w1 | if w0 & 1 != 0 { GEN_TAG } else { 0 };
-                            let comp = lookup(uid);
+                            let comp = cache.get(links, uid);
                             if comp == cur.comp {
                                 cur.b = i as u32 + 1;
                             } else {
@@ -1844,121 +1816,208 @@ fn run(
                             bits.mark(cur.comp, CL_HAVE, CL_MULTI);
                             cr.push(cur);
                         }
-                        done.push((task, cr));
-                    } else {
-                    let t = task - nparts - nt;
+                    }
                     for (k, &(tt, ii)) in gev_kept[t].iter().enumerate() {
                         let g = &outs[tt as usize].gev[t][ii as usize];
-                        let comp = lookup(g.uid);
+                        let comp = cache.get(links, g.uid);
                         bits.force(comp, EV_HAVE | EV_MULTI);
                         b[bucket_of(comp)].push(Entry { comp, kind: 2, sorted: true, t: t as u16, a: k as u32, b: 0 });
                     }
                     for (k, &(tt, ii)) in gcl_kept[t].iter().enumerate() {
                         let g = &outs[tt as usize].gcl[t][ii as usize];
-                        let comp = lookup(g.uid);
+                        let comp = cache.get(links, g.uid);
                         bits.force(comp, CL_HAVE | CL_MULTI);
                         b[bucket_of(comp)].push(Entry { comp, kind: 3, sorted: true, t: t as u16, a: k as u32, b: 0 });
                     }
-                    }
-                    }
-                    (done, b)
+                    (cr, b)
                 })
             })
             .collect();
         hs.into_iter().map(|h| h.join().unwrap()).collect()
     });
     let mut entries: Vec<Vec<Vec<Entry>>> = Vec::new();
-    let mut by_task: Vec<(usize, Vec<Run>)> = Vec::new();
-    for (d, b) in r1 {
-        by_task.extend(d);
-        entries.push(b);
-    }
-    by_task.sort_by_key(|x| x.0);
-    let mut evruns: Vec<Vec<Run>> = Vec::new();
     let mut cr_parts: Vec<Vec<Run>> = Vec::new();
-    for (task, runs) in by_task {
-        if task < nparts {
-            evruns.push(runs);
-        } else {
-            cr_parts.push(runs);
-        }
+    for (cr, b) in r1 {
+        cr_parts.push(cr);
+        entries.push(b);
     }
     let cr_all: Vec<Run> = cr_parts.concat();
     drop(cr_parts);
-    lap("runs");
+    lap("click runs");
 
-    // R2: simple persons (one sorted event run, at most one click run found in order)
+    // R2: one pass over the event table. Each run is processed as soon as it ends,
+    // unless it is clearly not simple; a person later found to have another run is undone below.
     let consumed: Vec<std::sync::atomic::AtomicU8> = (0..cr_all.len()).map(|_| std::sync::atomic::AtomicU8::new(0)).collect();
-    let evruns: Vec<Run> = evruns.concat();
-    const UNIT: usize = 2048;
-    let units = evruns.len().div_ceil(UNIT);
-    let next_u = AtomicUsize::new(0);
-    let r2: Vec<(Out, Vec<Vec<Entry>>)> = std::thread::scope(|s| {
+    let nparts = if ctx.pos { ctx.nparts } else { 0 };
+    let next_t = AtomicUsize::new(0);
+    struct Proc {
+        comp: u64,
+        a: u32,
+        b: u32,
+        found: u32,
+        rows: (u32, u32),
+    }
+    let r2: Vec<(Out, Vec<Vec<Entry>>, Vec<Proc>)> = std::thread::scope(|s| {
         let hs: Vec<_> = (0..nt)
             .map(|_| {
-                let (ev, cl, bits, evruns, cr_all, consumed, arenas, next_u) = (&ev, &cl, &bits, &evruns, &cr_all, &consumed, &arenas, &next_u);
+                let (ev, cl, links, bits, cr_all, consumed, next_t, sc, spill, spill_range) =
+                    (&ev, &cl, &links, &bits, &cr_all, &consumed, &next_t, &sc, &spill, &spill_range);
                 s.spawn(move || {
                     let mut out = new_out(ctx);
                     let mut b: Vec<Vec<Entry>> = (0..NB).map(|_| Vec::new()).collect();
+                    let mut procs: Vec<Proc> = Vec::new();
                     let mut evbuf: Vec<Ev> = Vec::new();
                     let mut clbuf: Vec<Cl> = Vec::new();
+                    let mut cache = CompCache::new();
                     loop {
-                    let u = next_u.fetch_add(1, Relaxed);
-                    if u >= units {
-                        break;
-                    }
-                    let runs = &evruns[u * UNIT..((u + 1) * UNIT).min(evruns.len())];
-                    let mut ci = match runs.first() {
-                        Some(r0) => cr_all.partition_point(|c| c.p < r0.p),
-                        None => 0,
-                    };
-                    for r in runs {
-                        let bt = bits.get(r.comp);
-                        let mut simple = r.sorted && bt & EV_MULTI == 0;
-                        let mut found = usize::MAX;
-                        if simple && bt & CL_HAVE != 0 {
-                            if bt & CL_MULTI != 0 || r.p >= u64::MAX - 1 {
-                                simple = false;
-                            } else {
-                                // runs with no order hint (p >= MAX-1) are skipped; they never match here
-                                while ci < cr_all.len() && (cr_all[ci].p < r.p || cr_all[ci].p >= u64::MAX - 1) {
-                                    ci += 1;
-                                }
-                                let mut j = ci;
-                                while j < cr_all.len() && (cr_all[j].p == r.p || cr_all[j].p >= u64::MAX - 1) {
-                                    if cr_all[j].comp == r.comp {
-                                        found = j;
-                                        break;
-                                    }
-                                    j += 1;
-                                }
-                                if found == usize::MAX {
-                                    simple = false;
+                        let task = next_t.fetch_add(1, Relaxed);
+                        if task >= nparts {
+                            break;
+                        }
+                        let base = task << ctx.shift;
+                        if ctx.scatter {
+                            let (sa, sb) = spill_range[task];
+                            for r in sc.region(task).iter().chain(spill[sa..sb].iter().map(|x| &x.1)) {
+                                let i = base + r.local as usize;
+                                let (w0s, w1) = (r.w0s, r.w1);
+                                if w0s > ev.w0(i).load(Relaxed) {
+                                    ev.w0(i).store(w0s, Relaxed);
+                                    ev.w1(i).store(w1, Relaxed);
                                 }
                             }
                         }
-                        if ctx.exp == 7 {
-                            let why = if !r.sorted { 0 } else if bt & EV_MULTI != 0 { 1 } else if bt & CL_MULTI != 0 { 2 } else if r.p >= u64::MAX - 1 { 3 } else if !simple { 4 } else { 5 };
-                            DBG[why].fetch_add(1, Relaxed);
+                        let lo = base.min(max_e);
+                        let hi = (base + (1 << ctx.shift)).min(max_e);
+                        let mut ci = usize::MAX; // click cursor, placed at the first run
+                        let mut cur = Run { comp: u64::MAX, p: 0, a: 0, b: 0, sorted: true };
+                        let mut last_ts = 0u64;
+                        let mut i = lo;
+                        loop {
+                            let at_end = i >= hi;
+                            let mut next_comp = u64::MAX;
+                            let mut uid = 0u64;
+                            let mut ts = 0u64;
+                            if !at_end {
+                                let s0 = ev.w0(i).load(Relaxed);
+                                if s0 == 0 {
+                                    i += 1;
+                                    continue;
+                                }
+                                let w0 = !s0;
+                                if w0 & (1 << 10) == 0 {
+                                    i += 1;
+                                    continue;
+                                }
+                                let w1 = ev.w1(i).load(Relaxed);
+                                uid = (w1 & (GEN_TAG - 1)) | if w0 & 8 != 0 { GEN_TAG } else { 0 };
+                                next_comp = cache.get(links, uid);
+                                ts = (w0 >> 11) & 0x7FFF_FFFF;
+                                if next_comp == cur.comp {
+                                    cur.b = i as u32 + 1;
+                                    if ts < last_ts {
+                                        cur.sorted = false;
+                                    }
+                                    last_ts = ts;
+                                    i += 1;
+                                    continue;
+                                }
+                            }
+                            // the current run (if any) has ended: judge and process it
+                            if cur.comp != u64::MAX {
+                                let r = cur;
+                                let had = bits.mark(r.comp, EV_HAVE, EV_MULTI);
+                                let bt = bits.get(r.comp);
+                                let mut simple = r.sorted && !had;
+                                let mut found = usize::MAX;
+                                if simple && bt & CL_HAVE != 0 {
+                                    if bt & CL_MULTI != 0 || r.p >= u64::MAX - 1 {
+                                        simple = false;
+                                    } else {
+                                        if ci == usize::MAX {
+                                            ci = cr_all.partition_point(|c| c.p < r.p);
+                                        }
+                                        while ci < cr_all.len() && (cr_all[ci].p < r.p || cr_all[ci].p >= u64::MAX - 1) {
+                                            ci += 1;
+                                        }
+                                        let mut j = ci;
+                                        while j < cr_all.len() && (cr_all[j].p == r.p || cr_all[j].p >= u64::MAX - 1) {
+                                            if cr_all[j].comp == r.comp {
+                                                found = j;
+                                                break;
+                                            }
+                                            j += 1;
+                                        }
+                                        if found == usize::MAX {
+                                            simple = false;
+                                        }
+                                    }
+                                }
+                                if !simple {
+                                    b[bucket_of(r.comp)].push(Entry { comp: r.comp, kind: 0, sorted: r.sorted, t: 0, a: r.a, b: r.b });
+                                } else {
+                                    evbuf.clear();
+                                    decode_events(ev, r.a as usize, r.b as usize, ctx, &mut evbuf);
+                                    clbuf.clear();
+                                    if found != usize::MAX {
+                                        consumed[found].store(1, Relaxed);
+                                        let c = cr_all[found];
+                                        decode_clicks(cl, c.a as usize, c.b as usize, ctx, &mut clbuf);
+                                        if clbuf.len() > 1 {
+                                            clbuf.sort_unstable_by_key(|c| (c.ts, match c.key { ClKey::Canon(m) => name_key(m), ClKey::Gen(..) => 0 }));
+                                        }
+                                    }
+                                    let row0 = out.users.len() as u32;
+                                    process_person(ctx, r.comp, &evbuf, &clbuf, &mut out);
+                                    procs.push(Proc { comp: r.comp, a: r.a, b: r.b, found: found as u32, rows: (row0, out.users.len() as u32) });
+                                }
+                            }
+                            if at_end {
+                                break;
+                            }
+                            cur = Run { comp: next_comp, p: person_hint(ctx, uid), a: i as u32, b: i as u32 + 1, sorted: true };
+                            last_ts = ts;
+                            i += 1;
                         }
-                        if !simple {
-                            b[bucket_of(r.comp)].push(Entry { comp: r.comp, kind: 0, sorted: r.sorted, t: 0, a: r.a, b: r.b });
+                    }
+                    (out, b, procs)
+                })
+            })
+            .collect();
+        hs.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+    lap("event pass");
+
+    // Undo: a person processed above whose bits now say "more than one run" goes to the buckets
+    let r2u: Vec<(Out, Vec<Vec<Entry>>)> = std::thread::scope(|s| {
+        let hs: Vec<_> = r2
+            .into_iter()
+            .map(|(mut out, mut b, procs)| {
+                let (ev, cl, bits, cr_all, consumed) = (&ev, &cl, &bits, &cr_all, &consumed);
+                s.spawn(move || {
+                    let mut evbuf: Vec<Ev> = Vec::new();
+                    let mut clbuf: Vec<Cl> = Vec::new();
+                    for p in &procs {
+                        if bits.get(p.comp) & EV_MULTI == 0 {
                             continue;
                         }
+                        for r in &mut out.users[p.rows.0 as usize..p.rows.1 as usize] {
+                            r.sessions = 0;
+                        }
                         evbuf.clear();
-                        decode_events(ev, r.a as usize, r.b as usize, ctx, &mut evbuf);
+                        decode_events(ev, p.a as usize, p.b as usize, ctx, &mut evbuf);
                         clbuf.clear();
-                        if found != usize::MAX {
-                            consumed[found].store(1, Relaxed);
-                            let c = cr_all[found];
+                        if p.found != u32::MAX {
+                            consumed[p.found as usize].store(0, Relaxed);
+                            let c = cr_all[p.found as usize];
                             decode_clicks(cl, c.a as usize, c.b as usize, ctx, &mut clbuf);
                             if clbuf.len() > 1 {
-                                // canonical IDs only: their name keys order like the strings
                                 clbuf.sort_unstable_by_key(|c| (c.ts, match c.key { ClKey::Canon(m) => name_key(m), ClKey::Gen(..) => 0 }));
                             }
                         }
-                        process_person(ctx, r.comp, &evbuf, &clbuf, &mut out);
-                    }
+                        out.neg = true;
+                        process_person(ctx, p.comp, &evbuf, &clbuf, &mut out);
+                        out.neg = false;
+                        b[bucket_of(p.comp)].push(Entry { comp: p.comp, kind: 0, sorted: true, t: 0, a: p.a, b: p.b });
                     }
                     (out, b)
                 })
@@ -1967,7 +2026,7 @@ fn run(
         hs.into_iter().map(|h| h.join().unwrap()).collect()
     });
     let mut fast_outs: Vec<Out> = Vec::new();
-    for (o, b) in r2 {
+    for (o, b) in r2u {
         fast_outs.push(o);
         entries.push(b);
     }
@@ -1994,10 +2053,6 @@ fn run(
     });
     entries.extend(r3);
     lap("simple persons");
-    if ctx.exp == 7 {
-        eprintln!("runs: unsorted {} ev_multi {} cl_multi {} no_p {} not_found {} simple {}; click runs {}",
-            DBG[0].load(Relaxed), DBG[1].load(Relaxed), DBG[2].load(Relaxed), DBG[3].load(Relaxed), DBG[4].load(Relaxed), DBG[5].load(Relaxed), cr_all.len());
-    }
 
     let ud = out_dir.join(names::OUT_A);
     let cd = out_dir.join(names::OUT_B);
