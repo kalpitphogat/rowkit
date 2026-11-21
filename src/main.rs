@@ -274,7 +274,8 @@ fn canon_key(mut v: u64) -> u64 {
 struct PInfo {
     comp: u64,
     mask: u8,
-    amb: bool,
+    amb: bool,      // aliases of this person in more than one set
+    nonlocal: bool, // its set has IDs of another person, or IDs this table does not cover
 }
 
 struct Links {
@@ -458,7 +459,7 @@ impl Links {
                 }
                 let pp = pp as usize;
                 if pinfo.len() <= pp {
-                    pinfo.resize(pp + 1, PInfo { comp: 0, mask: 0, amb: false });
+                    pinfo.resize(pp + 1, PInfo { comp: 0, mask: 0, amb: false, nonlocal: false });
                 }
                 let c = LINK_TAG | name[i];
                 let e = &mut pinfo[pp];
@@ -468,6 +469,35 @@ impl Links {
                     e.amb = true;
                 }
                 e.mask |= 1 << alias;
+            }
+            // a set is local when all its IDs are covered aliases of one person
+            let mut first_p: Vec<u32> = vec![u32::MAX; n];
+            const NONLOCAL: u32 = u32::MAX - 1;
+            let cover = |id: u64| -> Option<u32> {
+                if id & GEN_TAG != 0 {
+                    return None;
+                }
+                let nn = mix.decode(id, ukey);
+                if nn >= (1 << 39) || (nn & 511) >= 8 || (nn >> 9) >= pcap {
+                    return None;
+                }
+                Some((nn >> 9) as u32)
+            };
+            for (i, &id) in name_ids.iter().enumerate() {
+                let r = root[i] as usize;
+                first_p[r] = match (cover(id), first_p[r]) {
+                    (None, _) => NONLOCAL,
+                    (Some(_), NONLOCAL) => NONLOCAL,
+                    (Some(pp), u32::MAX) => pp,
+                    (Some(pp), q) => if q == pp { q } else { NONLOCAL },
+                };
+            }
+            for (i, &id) in name_ids.iter().enumerate() {
+                if let Some(pp) = cover(id) {
+                    if first_p[root[i] as usize] != pp {
+                        pinfo[pp as usize].nonlocal = true;
+                    }
+                }
             }
         }
         Links { tab, shard_shift, shard_bits, name, pinfo, pcap, pkey }
@@ -497,6 +527,33 @@ impl Links {
             }
         }
         self.comp(uid)
+    }
+
+    /// The generator person p when the set of `uid` holds only covered aliases of p
+    /// (so every row of that set has an ID that decodes to p), else None.
+    #[inline(always)]
+    fn local_person(&self, uid: u64) -> Option<usize> {
+        let (mix, ukey) = self.pkey?;
+        if uid & GEN_TAG != 0 {
+            return None;
+        }
+        let n = mix.decode(uid, ukey);
+        if n >= (1 << 39) || (n & 511) >= 8 || (n >> 9) >= self.pcap {
+            return None;
+        }
+        let pp = (n >> 9) as usize;
+        match self.pinfo.get(pp) {
+            None => Some(pp),
+            Some(e) => {
+                if e.mask & (1u8 << (n & 511)) == 0 {
+                    Some(pp) // unlinked: a set of its own
+                } else if !e.amb && !e.nonlocal {
+                    Some(pp)
+                } else {
+                    None
+                }
+            }
+        }
     }
 
     /// The person of a user ID: LINK_TAG | root for a linked ID, the ID itself otherwise.
@@ -1261,6 +1318,7 @@ fn flush_row(row: &mut UserRow, out: &mut Out) {
 #[derive(Clone, Copy)]
 struct Run {
     comp: u64,
+    loc: u32, // local person index (u32::MAX if not local)
     p: u64, // generator person of the first row's ID (ordering hint only)
     a: u32,
     b: u32,
@@ -1280,6 +1338,12 @@ struct Bits {
 }
 
 impl Bits {
+    /// Indexed by the key itself (keys below `entries`), no hashing.
+    fn direct(entries: usize) -> Bits {
+        let mut b = Bits::new(entries);
+        b.mask = u64::MAX; // marks "direct"
+        b
+    }
     fn new(entries: usize) -> Bits {
         let words = (entries / 16).max(1);
         // zeroed by the allocator (fresh pages), not by a serial loop
@@ -1290,6 +1354,9 @@ impl Bits {
     }
     #[inline(always)]
     fn at(&self, comp: u64) -> (usize, u32) {
+        if self.mask == u64::MAX {
+            return ((comp >> 4) as usize, ((comp & 15) * 4) as u32);
+        }
         let h = (hash64(comp ^ 0x2545_F491_4F6C_DD1D) >> 20) & self.mask;
         ((h >> 4) as usize, ((h & 15) * 4) as u32)
     }
@@ -1936,10 +2003,18 @@ fn run(
 
     // R1: click runs and generic rows; their bits are final before any event run is judged
     let bits = Bits::new(if ctx.pos { ((ctx.cap_e as usize / 2) / 25 * 32).next_power_of_two().clamp(1 << 20, 1 << 28) } else { 16 });
+    // for local persons: flags and click-run counts indexed by the person number itself
+    let pn = if ctx.pos { links.pcap as usize } else { 16 };
+    let pbits = Bits::direct(pn);
+    let clcnt: Vec<std::sync::atomic::AtomicU32> = {
+        let v: Vec<u64> = huge_zeroed(pn / 2);
+        let mut v = std::mem::ManuallyDrop::new(v);
+        unsafe { Vec::from_raw_parts(v.as_mut_ptr() as *mut std::sync::atomic::AtomicU32, pn, pn) }
+    };
     let r1: Vec<(Vec<Run>, Vec<Vec<Entry>>)> = std::thread::scope(|s| {
         let hs: Vec<_> = (0..nt)
             .map(|t| {
-                let (cl, links, gev_kept, gcl_kept, bits, outs) = (&cl, &links, &gev_kept, &gcl_kept, &bits, &outs);
+                let (cl, links, gev_kept, gcl_kept, bits, outs, pbits, clcnt) = (&cl, &links, &gev_kept, &gcl_kept, &bits, &outs, &pbits, &clcnt);
                 s.spawn(move || {
                     let mut b: Vec<Vec<Entry>> = (0..NB).map(|_| Vec::new()).collect();
                     let mut cr: Vec<Run> = Vec::new();
@@ -1947,7 +2022,7 @@ fn run(
                     if ctx.pos {
                         let lo = max_c * t / nt;
                         let hi = max_c * (t + 1) / nt;
-                        let mut cur = Run { comp: u64::MAX, p: 0, a: 0, b: 0, sorted: true };
+                        let mut cur = Run { comp: u64::MAX, loc: u32::MAX, p: 0, a: 0, b: 0, sorted: true };
                         for i in lo..hi {
                             let w0 = cl.w0(i).load(Relaxed);
                             if w0 == 0 {
@@ -1960,14 +2035,22 @@ fn run(
                                 cur.b = i as u32 + 1;
                             } else {
                                 if cur.comp != u64::MAX {
-                                    bits.mark(cur.comp, CL_HAVE, CL_MULTI);
+                                    if cur.loc != u32::MAX {
+                                        clcnt[cur.loc as usize].fetch_add(1, Relaxed);
+                                    } else {
+                                        bits.mark(cur.comp, CL_HAVE, CL_MULTI);
+                                    }
                                     cr.push(cur);
                                 }
-                                cur = Run { comp, p: person_hint(ctx, uid), a: i as u32, b: i as u32 + 1, sorted: true };
+                                cur = Run { comp, loc: links.local_person(uid).map(|x| x as u32).unwrap_or(u32::MAX), p: person_hint(ctx, uid), a: i as u32, b: i as u32 + 1, sorted: true };
                             }
                         }
                         if cur.comp != u64::MAX {
-                            bits.mark(cur.comp, CL_HAVE, CL_MULTI);
+                            if cur.loc != u32::MAX {
+                                clcnt[cur.loc as usize].fetch_add(1, Relaxed);
+                            } else {
+                                bits.mark(cur.comp, CL_HAVE, CL_MULTI);
+                            }
                             cr.push(cur);
                         }
                     }
@@ -1975,12 +2058,19 @@ fn run(
                         let g = &outs[tt as usize].gev[t][ii as usize];
                         let comp = cache.get(links, g.uid);
                         bits.force(comp, EV_HAVE | EV_MULTI);
+                        if let Some(pp) = links.local_person(g.uid) {
+                            pbits.force(pp as u64, EV_HAVE | EV_MULTI);
+                        }
                         b[bucket_of(comp)].push(Entry { comp, kind: 2, sorted: true, t: t as u16, a: k as u32, b: 0 });
                     }
                     for (k, &(tt, ii)) in gcl_kept[t].iter().enumerate() {
                         let g = &outs[tt as usize].gcl[t][ii as usize];
                         let comp = cache.get(links, g.uid);
                         bits.force(comp, CL_HAVE | CL_MULTI);
+                        if let Some(pp) = links.local_person(g.uid) {
+                            // counted but never in the run list: such a person is never taken as simple
+                            clcnt[pp].fetch_add(1, Relaxed);
+                        }
                         b[bucket_of(comp)].push(Entry { comp, kind: 3, sorted: true, t: t as u16, a: k as u32, b: 0 });
                     }
                     (cr, b)
@@ -2006,16 +2096,18 @@ fn run(
     let next_t = AtomicUsize::new(0);
     struct Proc {
         comp: u64,
+        loc: u32,
+        p: u64,
         a: u32,
         b: u32,
-        found: u32,
+        win: (u32, u32), // click runs consumed: those in this range that are this person's
         rows: (u32, u32),
     }
     let r2: Vec<(Out, Vec<Vec<Entry>>, Vec<Proc>)> = std::thread::scope(|s| {
         let hs: Vec<_> = (0..nt)
             .map(|_| {
-                let (ev, cl, links, bits, cr_all, consumed, next_t, sc, spill, spill_range) =
-                    (&ev, &cl, &links, &bits, &cr_all, &consumed, &next_t, &sc, &spill, &spill_range);
+                let (ev, cl, links, bits, cr_all, consumed, next_t, sc, spill, spill_range, pbits, clcnt) =
+                    (&ev, &cl, &links, &bits, &cr_all, &consumed, &next_t, &sc, &spill, &spill_range, &pbits, &clcnt);
                 s.spawn(move || {
                     let mut out = new_out(ctx);
                     let mut b: Vec<Vec<Entry>> = (0..NB).map(|_| Vec::new()).collect();
@@ -2043,7 +2135,7 @@ fn run(
                         let lo = base.min(max_e);
                         let hi = (base + (1 << ctx.shift)).min(max_e);
                         let mut ci = usize::MAX; // click cursor, placed at the first run
-                        let mut cur = Run { comp: u64::MAX, p: 0, a: 0, b: 0, sorted: true };
+                        let mut cur = Run { comp: u64::MAX, loc: u32::MAX, p: 0, a: 0, b: 0, sorted: true };
                         let mut last_ts = 0u64;
                         let mut i = lo;
                         loop {
@@ -2079,11 +2171,36 @@ fn run(
                             // the current run (if any) has ended: judge and process it
                             if cur.comp != u64::MAX {
                                 let r = cur;
-                                let had = bits.mark(r.comp, EV_HAVE, EV_MULTI);
-                                let bt = bits.get(r.comp);
+                                let local = r.loc != u32::MAX;
+                                let had = if local { pbits.mark(r.loc as u64, EV_HAVE, EV_MULTI) } else { bits.mark(r.comp, EV_HAVE, EV_MULTI) };
+                                let bt = if local { 0 } else { bits.get(r.comp) };
                                 let mut simple = r.sorted && !had;
                                 let mut found = usize::MAX;
-                                if simple && bt & CL_HAVE != 0 {
+                                let mut win = (0u32, 0u32);
+                                if simple && local {
+                                    let total = clcnt[r.loc as usize].load(Relaxed);
+                                    if total > 0 {
+                                        if ci == usize::MAX {
+                                            ci = cr_all.partition_point(|c| c.p < r.p);
+                                        }
+                                        while ci < cr_all.len() && (cr_all[ci].p < r.p || cr_all[ci].p >= u64::MAX - 1) {
+                                            ci += 1;
+                                        }
+                                        let mut j = ci;
+                                        let mut seen = 0u32;
+                                        while j < cr_all.len() && (cr_all[j].p == r.p || cr_all[j].p >= u64::MAX - 1) {
+                                            if cr_all[j].p == r.p && cr_all[j].loc == r.loc {
+                                                seen += 1;
+                                            }
+                                            j += 1;
+                                        }
+                                        if seen != total {
+                                            simple = false;
+                                        } else {
+                                            win = (ci as u32, j as u32);
+                                        }
+                                    }
+                                } else if simple && bt & CL_HAVE != 0 {
                                     if bt & CL_MULTI != 0 || r.p >= u64::MAX - 1 {
                                         simple = false;
                                     } else {
@@ -2116,21 +2233,30 @@ fn run(
                                         consumed[found].store(1, Relaxed);
                                         let c = cr_all[found];
                                         decode_clicks(cl, c.a as usize, c.b as usize, ctx, &mut clbuf);
-                                        if clbuf.len() > 1 {
-                                            clbuf.sort_unstable_by_key(|c| (c.ts, match c.key { ClKey::Canon(m) => name_key(m), ClKey::Gen(..) => 0 }));
+                                        win = (found as u32, found as u32 + 1);
+                                    } else if win.1 > win.0 {
+                                        for j in win.0 as usize..win.1 as usize {
+                                            let c = cr_all[j];
+                                            if c.comp == r.comp && c.p == r.p {
+                                                consumed[j].store(1, Relaxed);
+                                                decode_clicks(cl, c.a as usize, c.b as usize, ctx, &mut clbuf);
+                                            }
                                         }
+                                    }
+                                    if clbuf.len() > 1 {
+                                        clbuf.sort_unstable_by_key(|c| (c.ts, match c.key { ClKey::Canon(m) => name_key(m), ClKey::Gen(..) => 0 }));
                                     }
                                     let row0 = out.users.len() as u32;
                                     if ctx.exp != 5 {
                                         process_person(ctx, r.comp, &evbuf, &clbuf, &mut out);
                                     }
-                                    procs.push(Proc { comp: r.comp, a: r.a, b: r.b, found: found as u32, rows: (row0, out.users.len() as u32) });
+                                    procs.push(Proc { comp: r.comp, loc: r.loc, p: r.p, a: r.a, b: r.b, win, rows: (row0, out.users.len() as u32) });
                                 }
                             }
                             if at_end {
                                 break;
                             }
-                            cur = Run { comp: next_comp, p: person_hint(ctx, uid), a: i as u32, b: i as u32 + 1, sorted: true };
+                            cur = Run { comp: next_comp, loc: links.local_person(uid).map(|x| x as u32).unwrap_or(u32::MAX), p: person_hint(ctx, uid), a: i as u32, b: i as u32 + 1, sorted: true };
                             last_ts = ts;
                             i += 1;
                         }
@@ -2148,12 +2274,13 @@ fn run(
         let hs: Vec<_> = r2
             .into_iter()
             .map(|(mut out, mut b, procs)| {
-                let (ev, cl, bits, cr_all, consumed) = (&ev, &cl, &bits, &cr_all, &consumed);
+                let (ev, cl, bits, cr_all, consumed, pbits) = (&ev, &cl, &bits, &cr_all, &consumed, &pbits);
                 s.spawn(move || {
                     let mut evbuf: Vec<Ev> = Vec::new();
                     let mut clbuf: Vec<Cl> = Vec::new();
                     for p in &procs {
-                        if bits.get(p.comp) & EV_MULTI == 0 {
+                        let multi = if p.loc != u32::MAX { pbits.get(p.loc as u64) & EV_MULTI != 0 } else { bits.get(p.comp) & EV_MULTI != 0 };
+                        if !multi {
                             continue;
                         }
                         for r in &mut out.users[p.rows.0 as usize..p.rows.1 as usize] {
@@ -2162,13 +2289,15 @@ fn run(
                         evbuf.clear();
                         decode_events(ev, p.a as usize, p.b as usize, ctx, &mut evbuf);
                         clbuf.clear();
-                        if p.found != u32::MAX {
-                            consumed[p.found as usize].store(0, Relaxed);
-                            let c = cr_all[p.found as usize];
-                            decode_clicks(cl, c.a as usize, c.b as usize, ctx, &mut clbuf);
-                            if clbuf.len() > 1 {
-                                clbuf.sort_unstable_by_key(|c| (c.ts, match c.key { ClKey::Canon(m) => name_key(m), ClKey::Gen(..) => 0 }));
+                        for j in p.win.0 as usize..p.win.1 as usize {
+                            let c = cr_all[j];
+                            if c.comp == p.comp && (p.win.1 - p.win.0 == 1 || c.p == p.p) {
+                                consumed[j].store(0, Relaxed);
+                                decode_clicks(cl, c.a as usize, c.b as usize, ctx, &mut clbuf);
                             }
+                        }
+                        if clbuf.len() > 1 {
+                            clbuf.sort_unstable_by_key(|c| (c.ts, match c.key { ClKey::Canon(m) => name_key(m), ClKey::Gen(..) => 0 }));
                         }
                         out.neg = true;
                         process_person(ctx, p.comp, &evbuf, &clbuf, &mut out);
