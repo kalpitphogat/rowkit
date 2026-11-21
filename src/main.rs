@@ -445,19 +445,25 @@ impl Links {
         let mut pinfo: Vec<PInfo> = Vec::new();
         let pcap: u64 = 1 << 24;
         if let Some((mix, ukey)) = pkey {
-            for (i, &id) in name_ids.iter().enumerate() {
-                if id & GEN_TAG != 0 {
+            // covered person and alias of each ID, decoded once: pp << 3 | alias, or u32::MAX
+            let cov: Vec<u32> = name_ids
+                .iter()
+                .map(|&id| {
+                    if id & GEN_TAG != 0 {
+                        return u32::MAX;
+                    }
+                    let nn = mix.decode(id, ukey);
+                    if nn >= (1 << 39) || (nn & 511) >= 8 || (nn >> 9) >= pcap {
+                        return u32::MAX;
+                    }
+                    (((nn >> 9) as u32) << 3) | (nn & 7) as u32
+                })
+                .collect();
+            for (i, &cv) in cov.iter().enumerate() {
+                if cv == u32::MAX {
                     continue;
                 }
-                let n = mix.decode(id, ukey);
-                if n >= (1 << 39) {
-                    continue;
-                }
-                let (pp, alias) = (n >> 9, n & 511);
-                if pp >= pcap || alias >= 8 {
-                    continue;
-                }
-                let pp = pp as usize;
+                let (pp, alias) = ((cv >> 3) as usize, (cv & 7) as u64);
                 if pinfo.len() <= pp {
                     pinfo.resize(pp + 1, PInfo { comp: 0, mask: 0, amb: false, nonlocal: false });
                 }
@@ -473,27 +479,25 @@ impl Links {
             // a set is local when all its IDs are covered aliases of one person
             let mut first_p: Vec<u32> = vec![u32::MAX; n];
             const NONLOCAL: u32 = u32::MAX - 1;
-            let cover = |id: u64| -> Option<u32> {
-                if id & GEN_TAG != 0 {
-                    return None;
+            let cover = |i: usize| -> Option<u32> {
+                let cv = cov[i];
+                if cv == u32::MAX {
+                    None
+                } else {
+                    Some(cv >> 3)
                 }
-                let nn = mix.decode(id, ukey);
-                if nn >= (1 << 39) || (nn & 511) >= 8 || (nn >> 9) >= pcap {
-                    return None;
-                }
-                Some((nn >> 9) as u32)
             };
-            for (i, &id) in name_ids.iter().enumerate() {
+            for i in 0..name_ids.len() {
                 let r = root[i] as usize;
-                first_p[r] = match (cover(id), first_p[r]) {
+                first_p[r] = match (cover(i), first_p[r]) {
                     (None, _) => NONLOCAL,
                     (Some(_), NONLOCAL) => NONLOCAL,
                     (Some(pp), u32::MAX) => pp,
                     (Some(pp), q) => if q == pp { q } else { NONLOCAL },
                 };
             }
-            for (i, &id) in name_ids.iter().enumerate() {
-                if let Some(pp) = cover(id) {
+            for i in 0..name_ids.len() {
+                if let Some(pp) = cover(i) {
                     if first_p[root[i] as usize] != pp {
                         pinfo[pp as usize].nonlocal = true;
                     }
@@ -1487,22 +1491,37 @@ fn write_users(path: &Path, users: &[UserRow], ctx: &Ctx, links: &Links) {
     let mut c_day = parquet::Column::new(names::DAY, parquet::Kind::Date, n);
     let mut c_s = parquet::Column::new(names::N_S, parquet::Kind::I32, n);
     let mut c_e = parquet::Column::new(names::N_E, parquet::Kind::I32, n);
-    let mut c_r = parquet::Column::new(names::REV, parquet::Kind::I64, n);
+    // revenue as INT32 when every value of this file fits (any integer width is accepted)
+    let rev32 = users.iter().all(|r| r.revenue <= i32::MAX as u64);
+    let mut c_r = parquet::Column::new(names::REV, if rev32 { parquet::Kind::I32 } else { parquet::Kind::I64 }, n);
     let mut c_t = parquet::Column::new(names::TOP, parquet::Kind::OptStr, n);
     let mut buf = Vec::new();
+    let mut last = u64::MAX;
     for r in users {
         if r.sessions == 0 {
             continue; // removed by an undo
         }
-        uid_bytes(links.name_of(r.comp), &mut buf);
+        // a person's rows are consecutive: its name is built once
+        if r.comp != last || last == u64::MAX {
+            uid_bytes(links.name_of(r.comp), &mut buf);
+            last = r.comp;
+        }
         c_user.push_str(&buf);
         c_day.push_i32(r.day);
         c_s.push_i32(r.sessions as i32);
         c_e.push_i32(r.events as i32);
-        c_r.push_i64(r.revenue as i64);
+        if rev32 {
+            c_r.push_i32(r.revenue as i32);
+        } else {
+            c_r.push_i64(r.revenue as i64);
+        }
         c_t.push_opt(if r.top == u16::MAX { None } else { Some(&ctx.cats[r.top as usize]) });
     }
+    let tb = Instant::now();
     parquet::write(path, &[c_user, c_day, c_s, c_e, c_r, c_t]).expect("write");
+    if std::env::var("SS_TIMING2").is_ok() {
+        eprintln!("  file {:.1} ms", tb.elapsed().as_secs_f64() * 1e3);
+    }
 }
 
 // ---------------------------------------------------------------- person buckets
@@ -2483,7 +2502,11 @@ fn run(
                         }
                     }
                     // this thread's rows go straight to their own file
+                    let tw = Instant::now();
                     write_users(&ud.join(format!("part-{t}.parquet")), &out.users, ctx, links);
+                    if std::env::var("SS_TIMING2").is_ok() {
+                        eprintln!("w{t} write {:.1} ms rows {}", tw.elapsed().as_secs_f64() * 1e3, out.users.len());
+                    }
                     out.users = Vec::new();
                     out
                 })

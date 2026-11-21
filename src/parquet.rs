@@ -145,8 +145,10 @@ fn rle_defs(col: &Column) -> Vec<u8> {
 /// Writes the columns (all with the same row count) to `path` as one Parquet file.
 pub fn write(path: &std::path::Path, cols: &[Column]) -> std::io::Result<()> {
     let rows = cols.first().map(|c| c.rows).unwrap_or(0);
-    let mut file: Vec<u8> = Vec::with_capacity(cols.iter().map(|c| c.data.len() + 64).sum::<usize>() + 4096);
-    file.extend_from_slice(b"PAR1");
+    // Small parts (headers, levels, footer) are kept apart from the column data, and
+    // everything goes out with vectored writes: the column buffers are never copied.
+    let mut heads: Vec<Vec<u8>> = Vec::with_capacity(cols.len());
+    let mut flen = 4usize; // "PAR1"
     let mut metas: Vec<(usize, usize)> = Vec::new(); // (offset, size)
     for c in cols {
         let defs = if let Kind::OptStr = c.kind { rle_defs(c) } else { Vec::new() };
@@ -162,11 +164,12 @@ pub fn write(path: &std::path::Path, cols: &[Column]) -> std::io::Result<()> {
         h.i32(4, 3); // RLE
         h.end();
         h.b.push(0);
-        let off = file.len();
-        file.extend_from_slice(&h.b);
-        file.extend_from_slice(&defs);
-        file.extend_from_slice(&c.data);
-        metas.push((off, file.len() - off));
+        let off = flen;
+        let mut head = h.b;
+        head.extend_from_slice(&defs);
+        flen += head.len() + c.data.len();
+        heads.push(head);
+        metas.push((off, flen - off));
     }
     let mut t = Tw::new();
     t.i32(1, 1);
@@ -236,8 +239,31 @@ pub fn write(path: &std::path::Path, cols: &[Column]) -> std::io::Result<()> {
     t.i64(3, rows as i64);
     t.end();
     t.b.push(0);
-    file.extend_from_slice(&t.b);
-    file.extend_from_slice(&(t.b.len() as u32).to_le_bytes());
-    file.extend_from_slice(b"PAR1");
-    std::fs::write(path, &file)
+    let mut tail = t.b;
+    let flen_footer = tail.len() as u32;
+    tail.extend_from_slice(&flen_footer.to_le_bytes());
+    tail.extend_from_slice(b"PAR1");
+    let mut parts: Vec<&[u8]> = Vec::with_capacity(2 * cols.len() + 2);
+    parts.push(b"PAR1");
+    for (c, h) in cols.iter().zip(&heads) {
+        parts.push(h);
+        parts.push(&c.data);
+    }
+    parts.push(&tail);
+    write_all_vectored(path, &parts)
+}
+
+fn write_all_vectored(path: &std::path::Path, parts: &[&[u8]]) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut f = std::fs::File::create(path)?;
+    let mut bufs: Vec<std::io::IoSlice> = parts.iter().filter(|p| !p.is_empty()).map(|p| std::io::IoSlice::new(p)).collect();
+    let mut rest: &mut [std::io::IoSlice] = &mut bufs;
+    while !rest.is_empty() {
+        let n = f.write_vectored(rest)?;
+        if n == 0 {
+            return Err(std::io::Error::new(std::io::ErrorKind::WriteZero, "write"));
+        }
+        std::io::IoSlice::advance_slices(&mut rest, n);
+    }
+    Ok(())
 }
