@@ -155,6 +155,7 @@ struct Ctx {
     ingest_base_s: i64,
     shift: usize,
     nparts: usize,
+    scatter: bool,
     part_cap: usize,
     exp: u32,
 }
@@ -528,11 +529,76 @@ struct Rec {
     local: u32,
 }
 
+/// Event records by slot range ("partition"): one preallocated region per
+/// partition, filled in batches; records past a region's capacity spill to a list.
+struct Scatter {
+    buf: *mut Rec,
+    cap: usize,
+    fill: Vec<std::sync::atomic::AtomicU32>,
+    spill: Mutex<Vec<(u32, Rec)>>,
+}
+unsafe impl Sync for Scatter {}
+unsafe impl Send for Scatter {}
+
+const STAGE: usize = 8;
+
+impl Scatter {
+    fn new(nparts: usize, cap: usize) -> Scatter {
+        let n = nparts * cap;
+        let bytes = (n * std::mem::size_of::<Rec>()).max(64);
+        let p = unsafe {
+            let p = libc::mmap(
+                std::ptr::null_mut(),
+                bytes,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE,
+                -1,
+                0,
+            );
+            if p == libc::MAP_FAILED {
+                panic!("mmap scatter");
+            }
+            libc::madvise(p, bytes, libc::MADV_HUGEPAGE);
+            p as *mut Rec
+        };
+        Scatter {
+            buf: p,
+            cap,
+            fill: (0..nparts).map(|_| std::sync::atomic::AtomicU32::new(0)).collect(),
+            spill: Mutex::new(Vec::new()),
+        }
+    }
+    /// Copies `recs` (all for partition `part`) into its region.
+    #[inline]
+    fn push(&self, part: usize, recs: &[Rec]) {
+        let n = recs.len();
+        let at = self.fill[part].fetch_add(n as u32, Relaxed) as usize;
+        if at + n <= self.cap {
+            unsafe { std::ptr::copy_nonoverlapping(recs.as_ptr(), self.buf.add(part * self.cap + at), n) };
+        } else {
+            let mut sp = self.spill.lock().unwrap();
+            for (k, r) in recs.iter().enumerate() {
+                if at + k < self.cap {
+                    unsafe { *self.buf.add(part * self.cap + at + k) = *r };
+                } else {
+                    sp.push((part as u32, *r));
+                }
+            }
+        }
+    }
+    fn region(&self, part: usize) -> &[Rec] {
+        let n = (self.fill[part].load(Relaxed) as usize).min(self.cap);
+        unsafe { std::slice::from_raw_parts(self.buf.add(part * self.cap), n) }
+    }
+}
+
 struct ParseOut {
     links: Vec<(u64, u64)>,
     gev: Vec<Vec<GenEvent>>, // by hash % T
     gcl: Vec<Vec<GenClick>>,
     arena: Vec<u8>,
+    stage: Vec<Rec>,
+    stage_n: Vec<u8>,
     ring: [(usize, u64, u64); RING],
     ring_n: usize,
     cring: [(usize, u64, u64); RING],
@@ -557,6 +623,27 @@ const RING: usize = 16;
 const PREFETCHW: bool = true;
 
 impl ParseOut {
+    #[inline(always)]
+    fn stage(&mut self, sc: &Scatter, shift: usize, slot: usize, w0s: u64, w1: u64) {
+        let part = slot >> shift;
+        let k = self.stage_n[part] as usize;
+        self.stage[part * STAGE + k] = Rec { w0s, w1, local: (slot & ((1 << shift) - 1)) as u32 };
+        if k + 1 == STAGE {
+            sc.push(part, &self.stage[part * STAGE..part * STAGE + STAGE]);
+            self.stage_n[part] = 0;
+        } else {
+            self.stage_n[part] = (k + 1) as u8;
+        }
+    }
+    fn stage_flush(&mut self, sc: &Scatter) {
+        for part in 0..self.stage_n.len() {
+            let k = self.stage_n[part] as usize;
+            if k > 0 {
+                sc.push(part, &self.stage[part * STAGE..part * STAGE + k]);
+                self.stage_n[part] = 0;
+            }
+        }
+    }
     /// Queues a record; the slot is prefetched now and stored RING records later.
     #[inline(always)]
     fn put(&mut self, ev: &Dense, slot: usize, w0s: u64, w1: u64) {
@@ -640,7 +727,7 @@ static NOMARK: AtomicBool = AtomicBool::new(false);
 static ANOMALY: AtomicBool = AtomicBool::new(false);
 
 #[inline(always)]
-fn parse_event(f: &[&[u8]; 7], ctx: &Ctx, ev: &Dense, out: &mut ParseOut, nt: usize) {
+fn parse_event(f: &[&[u8]; 7], ctx: &Ctx, ev: &Dense, sc: &Scatter, out: &mut ParseOut, nt: usize) {
     let eid = f[0];
     if eid.is_empty() {
         return;
@@ -712,7 +799,11 @@ fn parse_event(f: &[&[u8]; 7], ctx: &Ctx, ev: &Dense, out: &mut ParseOut, nt: us
                     std::hint::black_box(w0 ^ w1);
                     return;
                 }
-                out.put(ev, slot, !w0, w1);
+                if ctx.scatter {
+                    out.stage(sc, ctx.shift, slot, !w0, w1);
+                } else {
+                    out.put(ev, slot, !w0, w1);
+                }
                 if slot > out.max_e {
                     out.max_e = slot;
                 }
@@ -1289,6 +1380,7 @@ fn main() {
         ingest_base_s: ws / 1000 - 15 * 86_400,
         shift: 15,
         nparts: 0,
+        scatter: false,
         part_cap: 0,
         exp: std::env::var("SS_EXP").ok().and_then(|v| v.parse().ok()).unwrap_or(0),
     };
@@ -1333,15 +1425,22 @@ fn run(
     rest.sort_by_key(|c| std::cmp::Reverse(c.3 - c.2));
     chunks.extend(rest);
 
-    if ctx.pos {
-        // slot ranges of about est/(4*nt): each is placed by one thread later, no atomics
+    ctx.scatter = ctx.pos && std::env::var("SS_SCATTER").is_ok();
+    if ctx.scatter {
+        // partitions of 16K to 64K slots (256 KB to 1 MB of table): placed in cache later
+        let span = ((ctx.cap_e / 2) as usize / 1024).next_power_of_two().clamp(1 << 14, 1 << 16);
+        ctx.shift = span.trailing_zeros() as usize;
+        ctx.nparts = ((ctx.cap_e as usize) >> ctx.shift) + 1;
+        ctx.part_cap = span + span / 4 + 64;
+    } else if ctx.pos {
+        // slot ranges for the run pass
         let target = ((ctx.cap_e / 2) as usize / (4 * nt)).max(1 << 12);
         ctx.shift = (usize::BITS - 1 - target.leading_zeros()) as usize;
         ctx.nparts = ((ctx.cap_e as usize) >> ctx.shift) + 1;
-        ctx.part_cap = (((ctx.cap_e / 2) as usize >> ctx.shift) / nt) * 11 / 10 + 64;
     } else {
         ctx.nparts = 1;
     }
+    let sc = Scatter::new(if ctx.scatter { ctx.nparts } else { 1 }, if ctx.scatter { ctx.part_cap } else { 1 });
     let ev = Dense::new(if ctx.pos { ctx.cap_e as usize } else { 1 });
     let cl = Dense::new(if ctx.pos { ctx.cap_c as usize } else { 1 });
 
@@ -1373,6 +1472,8 @@ fn run(
                     gev: (0..nt).map(|_| Vec::new()).collect(),
                     gcl: (0..nt).map(|_| Vec::new()).collect(),
                     arena: Vec::new(),
+                    stage: if ctxr.scatter { vec![Rec { w0s: 0, w1: 0, local: 0 }; ctxr.nparts * STAGE] } else { Vec::new() },
+                    stage_n: if ctxr.scatter { vec![0u8; ctxr.nparts] } else { Vec::new() },
                     ring: [(0, 0, 0); RING],
                     ring_n: 0,
                     cring: [(0, 0, 0); RING],
@@ -1424,7 +1525,7 @@ fn run(
                                     scan::lines::<7>(d, a, b, |f| c += f[0].len() + f[6].len());
                                     std::hint::black_box(c);
                                 }
-                                _ => scan::lines::<7>(d, a, b, |f| parse_event(f, ctxr, &ev, &mut out, nt)),
+                                _ => scan::lines::<7>(d, a, b, |f| parse_event(f, ctxr, &ev, &sc, &mut out, nt)),
                             }
                         }
                         _ => {
@@ -1440,6 +1541,9 @@ fn run(
                     }
                 }
                 out.flush(&ev);
+                if ctxr.scatter {
+                    out.stage_flush(&sc);
+                }
                 out.flush_clicks(&cl);
                 if !did_links {
                     link_pairs.lock().unwrap().push(std::mem::take(&mut out.links));
@@ -1538,6 +1642,23 @@ fn run(
     });
     lap("overflow");
 
+    // records that did not fit their partition's region, grouped by partition
+    let mut spill: Vec<(u32, Rec)> = std::mem::take(&mut *sc.spill.lock().unwrap());
+    spill.sort_by_key(|x| x.0);
+    let mut spill_range = vec![(0usize, 0usize); ctx.nparts.max(1)];
+    {
+        let mut i = 0;
+        while i < spill.len() {
+            let p = spill[i].0 as usize;
+            let mut j = i;
+            while j < spill.len() && spill[j].0 as usize == p {
+                j += 1;
+            }
+            spill_range[p] = (i, j);
+            i = j;
+        }
+    }
+
     // R1: runs of each table and occupancy bits per person
     let bits = Bits::new(if ctx.pos { ((ctx.cap_e as usize / 2) / 25 * 32).next_power_of_two().clamp(1 << 20, 1 << 28) } else { 16 });
     NOMARK.store(ctx.exp == 8, Relaxed);
@@ -1547,7 +1668,7 @@ fn run(
     let r1: Vec<(Vec<(usize, Vec<Run>)>, Vec<Vec<Entry>>)> = std::thread::scope(|s| {
         let hs: Vec<_> = (0..nt)
             .map(|_| {
-                let (ev, cl, links, gev_kept, gcl_kept, bits, outs, next_t) = (&ev, &cl, &links, &gev_kept, &gcl_kept, &bits, &outs, &next_t);
+                let (ev, cl, links, gev_kept, gcl_kept, bits, next_t, sc, spill, spill_range) = (&ev, &cl, &links, &gev_kept, &gcl_kept, &bits, &next_t, &sc, &spill, &spill_range);
                 s.spawn(move || {
                     let mut b: Vec<Vec<Entry>> = (0..NB).map(|_| Vec::new()).collect();
                     let mut done: Vec<(usize, Vec<Run>)> = Vec::new();
@@ -1570,6 +1691,18 @@ fn run(
                     }
                     if task < nparts {
                         let base = task << ctx.shift;
+                        if ctx.scatter {
+                            // place this partition: the copy with the smallest ingest wins (plain stores)
+                            let (sa, sb) = spill_range[task];
+                            for r in sc.region(task).iter().chain(spill[sa..sb].iter().map(|x| &x.1)) {
+                                let i = base + r.local as usize;
+                                let (w0s, w1) = (r.w0s, r.w1);
+                                if w0s > ev.w0(i).load(Relaxed) {
+                                    ev.w0(i).store(w0s, Relaxed);
+                                    ev.w1(i).store(w1, Relaxed);
+                                }
+                            }
+                        }
                         let mut er: Vec<Run> = Vec::new();
                         let lo = base.min(max_e);
                         let hi = (base + (1 << ctx.shift)).min(max_e);
