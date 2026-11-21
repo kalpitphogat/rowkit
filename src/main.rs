@@ -163,7 +163,7 @@ struct Ctx {
 impl Ctx {
     #[inline]
     fn product_cat(&self, s: &[u8]) -> u16 {
-        if let Some(n) = canon10(s, b"p") {
+        if let Some(n) = canon10_fast(s, b"p") {
             if (n as usize) < self.prod_dense.len() {
                 let c = self.prod_dense[n as usize];
                 if c != 0 {
@@ -179,7 +179,7 @@ impl Ctx {
     }
     #[inline]
     fn campaign(&self, s: &[u8]) -> Option<u16> {
-        if let Some(n) = canon10(s, b"c_") {
+        if let Some(n) = canon10_fast(s, b"c_") {
             if (n as usize) < self.camp_dense.len() {
                 let c = self.camp_dense[n as usize];
                 if c != 0 {

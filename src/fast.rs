@@ -298,3 +298,47 @@ mod tests {
         }
     }
 }
+
+/// Canonical decimal ID: `prefix` then 1..=8 digits with no leading zero (same
+/// contract as `text::canon10` for those lengths); longer IDs use the slow path.
+#[inline(always)]
+pub fn canon10_fast(s: &[u8], prefix: &[u8]) -> Option<u32> {
+    let p = prefix.len();
+    let n = s.len();
+    if n <= p || n > p + 8 || &s[..p] != prefix {
+        return crate::text::canon10(s, prefix);
+    }
+    let d = n - p;
+    if s[p] == b'0' && d > 1 {
+        return None;
+    }
+    unsafe {
+        let mut v = load8(s.as_ptr().add(n - 8));
+        if d < 8 {
+            let m = (1u64 << ((8 - d) * 8)) - 1;
+            v = (v & !m) | (0x3030_3030_3030_3030 & m);
+        }
+        if !all_digits(v) {
+            return None;
+        }
+        Some(parse8(v) as u32)
+    }
+}
+
+#[cfg(test)]
+mod canon10_tests {
+    use super::*;
+    use crate::text::canon10;
+    #[test]
+    fn matches_slow() {
+        let mut buf = vec![b'x'; 64];
+        let cases: &[&[u8]] = &[b"p1", b"p0", b"p01", b"p12345", b"p50000", b"P1", b"p", b"pa", b"p12a", b"p123456789", b"p1234567", b"p12345678", b"q1", b"p-1", b"p 1", b"c_1", b"c_0", b"c_01", b"c_1999", b"c_", b"c1"];
+        for c in cases {
+            let at = 32;
+            buf[at..at + c.len()].copy_from_slice(c);
+            let f = &buf[at..at + c.len()];
+            assert_eq!(canon10_fast(f, b"p"), canon10(c, b"p"), "{:?}", String::from_utf8_lossy(c));
+            assert_eq!(canon10_fast(f, b"c_"), canon10(c, b"c_"), "{:?}", String::from_utf8_lossy(c));
+        }
+    }
+}
