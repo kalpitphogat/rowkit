@@ -230,6 +230,19 @@ fn uid_bytes(enc: u64, out: &mut Vec<u8>) {
     }
 }
 
+const P36: [u64; 9] = [1, 36, 1296, 46_656, 1_679_616, 60_466_176, 2_176_782_336, 78_364_164_096, 2_821_109_907_456];
+
+/// Order key of the canonical ID with value v (< 2^40): its digits left-aligned to
+/// eight places, then its length, so that comparing keys compares the strings.
+#[inline]
+fn name_key(v: u64) -> u64 {
+    let mut len = 1;
+    while len < 8 && v >= P36[len] {
+        len += 1;
+    }
+    ((v * P36[8 - len]) << 4) | len as u64
+}
+
 /// Order key for canonical IDs: base-36 digits as ASCII, left-aligned big-endian.
 #[inline]
 fn canon_key(mut v: u64) -> u64 {
@@ -254,11 +267,15 @@ fn canon_key(mut v: u64) -> u64 {
 // ---------------------------------------------------------------- union-find over linked ids
 
 struct Links {
-    tab: Vec<[u64; 2]>, // open addressing: (key+1, index); key 0 = empty
-    mask: usize,
+    // Sharded open addressing. Entry = (key+1) << IDX_BITS | index; 0 = empty.
+    tab: Vec<u64>,
+    shard_shift: u32, // shard = hash >> shard_shift
+    shard_bits: u32,  // log2 of the entries per shard
     root: Vec<u32>,
     name: Vec<u64>, // per root: uid enc of the smallest ID
 }
+
+const IDX_BITS: u32 = 23;
 
 #[inline(always)]
 fn hash64(x: u64) -> u64 {
@@ -266,130 +283,168 @@ fn hash64(x: u64) -> u64 {
     x ^ (x >> 29)
 }
 
+/// A big zeroed array on huge pages (falls back to normal pages silently).
+fn huge_zeroed(n: usize) -> Vec<u64> {
+    // calloc-backed: big allocations are fresh zero pages; advise huge pages before first touch
+    let mut v: Vec<u64> = vec![0u64; n];
+    let bytes = n * 8;
+    if bytes >= (4 << 20) {
+        let p = v.as_mut_ptr() as usize;
+        let a = (p + (2 << 20) - 1) & !((2 << 20) - 1);
+        let e = (p + bytes) & !((2 << 20) - 1);
+        if e > a {
+            unsafe { libc::madvise(a as *mut libc::c_void, e - a, libc::MADV_HUGEPAGE) };
+        }
+    }
+    v
+}
+
 impl Links {
     fn build(pairs: Vec<Vec<(u64, u64)>>) -> Links {
+        let show = std::env::var("SS_TIMING").is_ok();
+        let cpu = || -> f64 {
+            let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+            unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut ts) };
+            ts.tv_sec as f64 * 1e3 + ts.tv_nsec as f64 / 1e6
+        };
+        let c0 = cpu();
+        let stamp = |what: &str| {
+            if show {
+                eprintln!("      uf cpu {:>7.1} ms {}", cpu() - c0, what);
+            }
+        };
         let total: usize = pairs.iter().map(|p| p.len()).sum();
-        let cap = (total * 4).next_power_of_two().max(1024);
-        let mask = cap - 1;
-        // (key+1, index) side by side; zeroed lazily by the allocator
-        let mut tab: Vec<[u64; 2]> = vec![[0u64; 2]; cap];
-        let mut flat: Vec<u64> = Vec::with_capacity(total * 2);
+        let occ = total * 2;
+        // shards of about 8K occurrences: each shard's table fits in L2 while it is built
+        let shards = (occ / 8192).next_power_of_two().max(1);
+        let sb = shards.trailing_zeros();
+        let shard_shift = 64 - sb;
+        let mut counts = vec![0usize; shards];
+        let shard_of = |k: u64| -> usize { if sb == 0 { 0 } else { (hash64(k) >> shard_shift) as usize } };
         for v in &pairs {
             for &(a, b) in v {
-                flat.push(a);
-                flat.push(b);
+                counts[shard_of(a)] += 1;
+                counts[shard_of(b)] += 1;
+            }
+        }
+        let maxc = counts.iter().copied().max().unwrap_or(0);
+        let shard_bits = ((maxc * 11 / 10).max(16)).next_power_of_two().trailing_zeros();
+        let per = 1usize << shard_bits;
+        let mut start = vec![0usize; shards + 1];
+        for i in 0..shards {
+            start[i + 1] = start[i] + counts[i];
+        }
+        // ids grouped by shard, with the position of each occurrence
+        let mut by: Vec<(u64, u32)> = vec![(0, 0); occ];
+        let mut fill = start.clone();
+        let mut pos = 0u32;
+        for v in &pairs {
+            for &(a, b) in v {
+                for k in [a, b] {
+                    let sh = shard_of(k);
+                    by[fill[sh]] = (k, pos);
+                    fill[sh] += 1;
+                    pos += 1;
+                }
             }
         }
         drop(pairs);
-        let mut ids: Vec<u64> = Vec::with_capacity(total * 2);
-        let mut idx: Vec<u32> = Vec::with_capacity(total * 2);
-        const D: usize = 16;
-        for i in 0..flat.len() {
-            if i + D < flat.len() {
-                let hp = hash64(flat[i + D]) as usize & mask;
-                unsafe {
-                    use std::arch::x86_64::*;
-                    _mm_prefetch::<_MM_HINT_T0>(tab.as_ptr().add(hp) as *const i8);
-                }
-            }
-            let k = flat[i];
-            let mut h = hash64(k) as usize & mask;
-            let id = loop {
-                let e = tab[h];
-                if e[0] == k + 1 {
-                    break e[1] as u32;
-                }
-                if e[0] == 0 {
-                    let n = ids.len() as u32;
-                    tab[h] = [k + 1, n as u64];
-                    ids.push(k);
-                    break n;
-                }
-                h = (h + 1) & mask;
-            };
-            idx.push(id);
-        }
-        drop(flat);
-        let mut parent: Vec<u32> = (0..ids.len() as u32).collect();
-        fn find(parent: &mut [u32], mut x: u32) -> u32 {
-            while parent[x as usize] != x {
-                let p = parent[x as usize];
-                parent[x as usize] = parent[p as usize];
-                x = parent[x as usize];
-            }
-            x
-        }
-        for pr in idx.chunks_exact(2) {
-            {
-                let (ia, ib) = (pr[0], pr[1]);
-                let ra = find(&mut parent, ia);
-                let rb = find(&mut parent, ib);
-                if ra != rb {
-                    if ra < rb {
-                        parent[rb as usize] = ra;
-                    } else {
-                        parent[ra as usize] = rb;
+        stamp("scatter");
+        let mut tab: Vec<u64> = huge_zeroed(shards * per);
+        let mut ids: Vec<u64> = Vec::with_capacity(occ);
+        let mut keys: Vec<u64> = Vec::with_capacity(occ);
+        let mut idx: Vec<u32> = vec![0; occ];
+        let lmask = per - 1;
+        for sh in 0..shards {
+            let base = sh * per;
+            for &(k, at) in &by[start[sh]..start[sh + 1]] {
+                let mut h = hash64(k) as usize & lmask;
+                let id = loop {
+                    let e = tab[base + h];
+                    if e == 0 {
+                        let n = ids.len() as u64;
+                        assert!(n < (1 << IDX_BITS), "too many linked IDs");
+                        tab[base + h] = ((k + 1) << IDX_BITS) | n;
+                        ids.push(k);
+                        keys.push(if k & GEN_TAG == 0 { name_key(k) } else { u64::MAX });
+                        break n as u32;
                     }
-                }
+                    if e >> IDX_BITS == k + 1 {
+                        break (e & ((1 << IDX_BITS) - 1)) as u32;
+                    }
+                    h = (h + 1) & lmask;
+                };
+                idx[at as usize] = id;
             }
         }
-        let n = parent.len();
-        let mut root = vec![0u32; n];
-        for i in 0..n {
-            root[i] = find(&mut parent, i as u32);
+        drop(by);
+        stamp("insert");
+        // node = (parent, name key) in one 16-byte entry
+        let mut node: Vec<[u64; 2]> = keys.iter().enumerate().map(|(i, &k)| [i as u64, k]).collect();
+        drop(keys);
+        fn find(node: &mut [[u64; 2]], mut x: u32) -> u32 {
+            loop {
+                let p = node[x as usize][0] as u32;
+                if p == x {
+                    return x;
+                }
+                let gp = node[p as usize][0];
+                node[x as usize][0] = gp;
+                x = gp as u32;
+            }
         }
-        // smallest ID per root
-        let mut name: Vec<u64> = vec![u64::MAX; n];
-        let mut best_key: Vec<u64> = vec![u64::MAX; n];
+        // union by name: the root of every set is its byte-wise smallest ID
         let mut sa = Vec::new();
         let mut sb = Vec::new();
-        for i in 0..n {
-            let r = root[i] as usize;
-            let id = ids[i];
-            if name[r] == u64::MAX {
-                name[r] = id;
-                best_key[r] = if id & GEN_TAG == 0 { canon_key(id) } else { 0 };
-                continue;
+        let less = |node: &[[u64; 2]], x: u32, y: u32, sa: &mut Vec<u8>, sb: &mut Vec<u8>| -> bool {
+            let (kx, ky) = (node[x as usize][1], node[y as usize][1]);
+            if kx != u64::MAX && ky != u64::MAX {
+                return kx < ky;
             }
-            let cur = name[r];
-            let smaller = if id & GEN_TAG == 0 && cur & GEN_TAG == 0 {
-                let k = canon_key(id);
-                if k < best_key[r] {
-                    best_key[r] = k;
-                    true
+            uid_bytes(ids[x as usize], sa);
+            uid_bytes(ids[y as usize], sb);
+            sa < sb
+        };
+        for pr in idx.chunks_exact(2) {
+            let ra = find(&mut node, pr[0]);
+            let rb = find(&mut node, pr[1]);
+            if ra != rb {
+                if less(&node, ra, rb, &mut sa, &mut sb) {
+                    node[rb as usize][0] = ra as u64;
                 } else {
-                    false
+                    node[ra as usize][0] = rb as u64;
                 }
-            } else {
-                uid_bytes(id, &mut sa);
-                uid_bytes(cur, &mut sb);
-                if sa < sb {
-                    best_key[r] = if id & GEN_TAG == 0 { canon_key(id) } else { 0 };
-                    true
-                } else {
-                    false
-                }
-            };
-            if smaller {
-                name[r] = id;
             }
         }
-        Links { tab, mask, root, name }
+        stamp("union");
+        let n = node.len();
+        let mut root = vec![0u32; n];
+        for i in 0..n {
+            root[i] = find(&mut node, i as u32);
+        }
+        let name = ids;
+        stamp(&format!("names ({} ids, {} occurrences)", n, occ));
+        Links { tab, shard_shift, shard_bits, root, name }
     }
 
     /// The person of a user ID: LINK_TAG | root for a linked ID, the ID itself otherwise.
     #[inline(always)]
     fn comp(&self, uid: u64) -> u64 {
-        let mut h = hash64(uid) as usize & self.mask;
+        let hh = hash64(uid);
+        let sh = if self.shard_shift >= 64 { 0 } else { (hh >> self.shard_shift) as usize };
+        let lmask = (1usize << self.shard_bits) - 1;
+        let base = sh << self.shard_bits;
+        let mut h = hh as usize & lmask;
+        let want = uid + 1;
         loop {
-            let e = unsafe { *self.tab.get_unchecked(h) };
-            if e[0] == uid + 1 {
-                return LINK_TAG | unsafe { *self.root.get_unchecked(e[1] as usize) } as u64;
+            let e = unsafe { *self.tab.get_unchecked(base + h) };
+            if e >> IDX_BITS == want {
+                return LINK_TAG | unsafe { *self.root.get_unchecked((e & ((1 << IDX_BITS) - 1)) as usize) } as u64;
             }
-            if e[0] == 0 {
+            if e == 0 {
                 return uid;
             }
-            h = (h + 1) & self.mask;
+            h = (h + 1) & lmask;
         }
     }
 
@@ -1000,7 +1055,7 @@ impl Bits {
     fn new(entries: usize) -> Bits {
         let words = (entries / 16).max(1);
         // zeroed by the allocator (fresh pages), not by a serial loop
-        let v: Vec<u64> = vec![0u64; words];
+        let v: Vec<u64> = huge_zeroed(words);
         let mut v = std::mem::ManuallyDrop::new(v);
         let w = unsafe { Vec::from_raw_parts(v.as_mut_ptr() as *mut AtomicU64, v.len(), v.capacity()) };
         Bits { w, mask: (entries as u64) - 1 }
@@ -1488,7 +1543,7 @@ fn run(
     lap("overflow");
 
     // R1: runs of each table and occupancy bits per person
-    let bits = Bits::new(if ctx.pos { 1 << 25 } else { 16 });
+    let bits = Bits::new(if ctx.pos { ((ctx.cap_e as usize / 2) / 25 * 32).next_power_of_two().clamp(1 << 20, 1 << 28) } else { 16 });
     NOMARK.store(ctx.exp == 8, Relaxed);
     let nparts = if ctx.pos { ctx.nparts } else { 0 };
     let ntasks = nparts + 2 * nt;
