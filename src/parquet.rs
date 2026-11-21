@@ -6,6 +6,7 @@ pub enum Kind {
     Str,
     OptStr,
     Date,
+    I32,
     I64,
 }
 
@@ -23,7 +24,7 @@ impl Column {
     pub fn new(name: &'static str, kind: Kind, cap_rows: usize) -> Self {
         let per = match kind {
             Kind::Str | Kind::OptStr => 14,
-            Kind::Date => 4,
+            Kind::Date | Kind::I32 => 4,
             Kind::I64 => 8,
         };
         Column { name, kind, data: Vec::with_capacity(cap_rows * per), defs: Vec::new(), rows: 0 }
@@ -181,6 +182,7 @@ pub fn write(path: &std::path::Path, cols: &[Column]) -> std::io::Result<()> {
             Kind::Str => (6, 0, 0),
             Kind::OptStr => (6, 1, 0),
             Kind::Date => (1, 0, 6),
+            Kind::I32 => (1, 0, -1),
             Kind::I64 => (2, 0, -1),
         };
         t.i32(1, ty);
@@ -211,7 +213,7 @@ pub fn write(path: &std::path::Path, cols: &[Column]) -> std::io::Result<()> {
         t.begin(3);
         let ty = match c.kind {
             Kind::Str | Kind::OptStr => 6,
-            Kind::Date => 1,
+            Kind::Date | Kind::I32 => 1,
             Kind::I64 => 2,
         };
         t.i32(1, ty);

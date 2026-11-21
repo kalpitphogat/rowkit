@@ -1278,8 +1278,8 @@ fn write_users(path: &Path, users: &[UserRow], ctx: &Ctx, links: &Links) {
     let n = users.iter().filter(|r| r.sessions != 0).count();
     let mut c_user = parquet::Column::new(names::A_ID, parquet::Kind::Str, n);
     let mut c_day = parquet::Column::new(names::DAY, parquet::Kind::Date, n);
-    let mut c_s = parquet::Column::new(names::N_S, parquet::Kind::I64, n);
-    let mut c_e = parquet::Column::new(names::N_E, parquet::Kind::I64, n);
+    let mut c_s = parquet::Column::new(names::N_S, parquet::Kind::I32, n);
+    let mut c_e = parquet::Column::new(names::N_E, parquet::Kind::I32, n);
     let mut c_r = parquet::Column::new(names::REV, parquet::Kind::I64, n);
     let mut c_t = parquet::Column::new(names::TOP, parquet::Kind::OptStr, n);
     let mut buf = Vec::new();
@@ -1290,8 +1290,8 @@ fn write_users(path: &Path, users: &[UserRow], ctx: &Ctx, links: &Links) {
         uid_bytes(links.name_of(r.comp), &mut buf);
         c_user.push_str(&buf);
         c_day.push_i32(r.day);
-        c_s.push_i64(r.sessions as i64);
-        c_e.push_i64(r.events as i64);
+        c_s.push_i32(r.sessions as i32);
+        c_e.push_i32(r.events as i32);
         c_r.push_i64(r.revenue as i64);
         c_t.push_opt(if r.top == u16::MAX { None } else { Some(&ctx.cats[r.top as usize]) });
     }
