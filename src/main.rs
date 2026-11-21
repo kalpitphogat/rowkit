@@ -9,6 +9,7 @@
 mod fast;
 mod names;
 mod parquet;
+mod probe;
 mod scan;
 mod text;
 
@@ -1603,6 +1604,9 @@ fn bucket_of(comp: u64) -> usize {
 // ---------------------------------------------------------------- main
 
 fn main() {
+    if std::env::var("SS_PROBE").is_ok() {
+        probe::run();
+    }
     // Fewer, larger heap regions: big buffers come from one padded arena instead of
     // fresh mappings, so threads fault less and contend less on the address-space lock.
     if std::env::var("SS_NOMALLOPT").is_err() {
@@ -1755,7 +1759,7 @@ fn main() {
         scatter: false,
         mail: false,
         owner_mul: 0,
-        tok_pdep: std::env::var("SS_TOK").map(|v| v == "pdep").unwrap_or(false),
+        tok_pdep: std::env::var("SS_TOK").map(|v| v == "pdep").unwrap_or(true),
         part_cap: 0,
         exp: std::env::var("SS_EXP").ok().and_then(|v| v.parse().ok()).unwrap_or(0),
     };
@@ -1800,7 +1804,7 @@ fn run(
     rest.sort_by_key(|c| std::cmp::Reverse(c.3 - c.2));
     chunks.extend(rest);
 
-    ctx.scatter = ctx.pos && std::env::var("SS_SCATTER").is_ok();
+    ctx.scatter = ctx.pos && std::env::var("SS_SCATTER").map(|v| v != "0").unwrap_or(true);
     if ctx.scatter {
         // partitions of 16K to 64K slots (256 KB to 1 MB of table): placed in cache later
         let span = std::env::var("SS_SPAN").ok().and_then(|v| v.parse().ok()).unwrap_or(((ctx.cap_e / 2) as usize / 1024).next_power_of_two().clamp(1 << 14, 1 << 16));
