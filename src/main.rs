@@ -1511,6 +1511,16 @@ fn bucket_of(comp: u64) -> usize {
 // ---------------------------------------------------------------- main
 
 fn main() {
+    // Fewer, larger heap regions: big buffers come from one padded arena instead of
+    // fresh mappings, so threads fault less and contend less on the address-space lock.
+    if std::env::var("SS_NOMALLOPT").is_err() {
+        unsafe {
+            libc::mallopt(-8, 1); // M_ARENA_MAX
+            libc::mallopt(-3, 64 << 20); // M_MMAP_THRESHOLD
+            libc::mallopt(-1, 256 << 20); // M_TRIM_THRESHOLD
+            libc::mallopt(-2, 64 << 20); // M_TOP_PAD
+        }
+    }
     let t0 = Instant::now();
     let data_dir = PathBuf::from(std::env::var("DATA_DIR").unwrap_or("/data".into()));
     let out_dir = PathBuf::from(std::env::var("OUTPUT_DIR").unwrap_or("/output".into()));
@@ -1724,7 +1734,7 @@ fn run(
     let ev = Dense::new(if ctx.pos { ctx.cap_e as usize } else { 1 });
     let cl = Dense::new(if ctx.pos { ctx.cap_c as usize } else { 1 });
 
-    let use_mmap = std::env::var("SS_READ").is_err();
+    let use_mmap = std::env::var("SS_MMAP").is_ok();
     let open_all = |files: &[(PathBuf, &'static [u8])]| -> Vec<std::fs::File> {
         files.iter().map(|f| std::fs::File::open(&f.0).expect("open")).collect()
     };
