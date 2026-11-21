@@ -1299,6 +1299,15 @@ fn run(
         files.iter().map(|f| std::fs::File::open(&f.0).expect("open")).collect()
     };
     let (lfd, efd, cfd) = (open_all(link_files), open_all(event_files), open_all(click_files));
+    let remaining: Vec<Vec<AtomicUsize>> = [link_files, event_files, click_files]
+        .iter()
+        .enumerate()
+        .map(|(k, fs)| {
+            (0..fs.len())
+                .map(|fi| AtomicUsize::new(chunks.iter().filter(|c| c.0 as usize == k && c.1 == fi).count()))
+                .collect()
+        })
+        .collect();
     let next = AtomicUsize::new(0);
     let links_done = AtomicUsize::new(0);
     let link_pairs: Mutex<Vec<Vec<(u64, u64)>>> = Mutex::new(Vec::new());
@@ -1371,6 +1380,13 @@ fn run(
                             scan::lines::<4>(d, a, b, |f| parse_click(f, ctxr, &cl, &mut out, nt));
                         }
                     }
+                    // the last worker done with a file unmaps it, so exit has less to tear down
+                    if remaining[kind as usize][fi].fetch_sub(1, Relaxed) == 1 && use_mmap {
+                        let m = fset[fi].1;
+                        if !m.is_empty() {
+                            unsafe { libc::munmap(m.as_ptr() as *mut libc::c_void, m.len()) };
+                        }
+                    }
                 }
                 out.flush(&ev);
                 out.flush_clicks(&cl);
@@ -1399,12 +1415,13 @@ fn run(
     });
     lap("parse + links");
 
-    if ANOMALY.load(Relaxed) {
+    if ANOMALY.load(Relaxed) || (std::env::var("SS_FORCE_ANOMALY").is_ok() && ctx.pos) {
         // Rare: an input the dense layout cannot hold. Redo everything on the generic path.
-        ANOMALY.store(false, Relaxed);
-        ctx.pos = false;
+        // The inputs may already be unmapped: start over as a fresh process on the generic path.
         eprintln!("anomaly: falling back to the generic path");
-        return run(ctx, nt, link_files, event_files, click_files, out_dir, t0, timing);
+        let exe = std::env::current_exe().expect("exe");
+        let st = std::process::Command::new(exe).env("SS_GENERIC", "1").status().expect("rerun");
+        unsafe { libc::_exit(st.code().unwrap_or(1)) };
     }
     let ctx = &ctx;
 
