@@ -1626,38 +1626,71 @@ fn run(
 
     // generic dedup (events: smallest ingest; clicks: any copy), per hash partition
     let arenas: Vec<&Vec<u8>> = outs.iter().map(|o| &o.arena).collect();
-    let (gev_kept, gcl_kept): (Vec<Vec<(GenEvent, u16)>>, Vec<Vec<(GenClick, u16)>>) = std::thread::scope(|s| {
+    // kept rows are referenced as (thread, index) into that thread's list for this partition
+    let (gev_kept, gcl_kept): (Vec<Vec<(u16, u32)>>, Vec<Vec<(u16, u32)>>) = std::thread::scope(|s| {
         let hs: Vec<_> = (0..nt)
             .map(|p| {
                 let outs = &outs;
                 let arenas = &arenas;
                 s.spawn(move || {
-                    let mut best: HashMap<(u64, &[u8]), (GenEvent, u16)> = HashMap::new();
+                    // events: sort by (hash, ingest); the first copy of each ID is the one kept
+                    let mut refs: Vec<(u64, i64, u16, u32)> = Vec::new();
                     for (t, o) in outs.iter().enumerate() {
-                        for g in &o.gev[p] {
-                            let key = &arenas[t][g.eid_off as usize..(g.eid_off + g.eid_len) as usize];
-                            match best.get_mut(&(g.hash, key)) {
-                                Some(cur) => {
-                                    if g.ingest < cur.0.ingest {
-                                        *cur = (*g, t as u16);
-                                    }
-                                }
-                                None => {
-                                    best.insert((g.hash, key), (*g, t as u16));
-                                }
-                            }
+                        for (i, g) in o.gev[p].iter().enumerate() {
+                            refs.push((g.hash, g.ingest, t as u16, i as u32));
                         }
                     }
-                    let evs: Vec<(GenEvent, u16)> = best.into_values().filter(|(g, _)| g.valid).collect();
-                    let mut seen: HashMap<(u64, &[u8]), ()> = HashMap::new();
-                    let mut cls = Vec::new();
-                    for (t, o) in outs.iter().enumerate() {
-                        for g in &o.gcl[p] {
-                            let key = &arenas[t][g.cid_off as usize..(g.cid_off + g.cid_len) as usize];
-                            if seen.insert((g.hash, key), ()).is_none() {
-                                cls.push((*g, t as u16));
+                    refs.sort_unstable_by_key(|r| (r.0, r.1));
+                    let key_e = |t: u16, i: u32| -> &[u8] {
+                        let g = &outs[t as usize].gev[p][i as usize];
+                        &arenas[t as usize][g.eid_off as usize..(g.eid_off + g.eid_len) as usize]
+                    };
+                    let mut evs: Vec<(u16, u32)> = Vec::new();
+                    let mut g0 = 0;
+                    while g0 < refs.len() {
+                        let mut g1 = g0;
+                        while g1 < refs.len() && refs[g1].0 == refs[g0].0 {
+                            g1 += 1;
+                        }
+                        for j in g0..g1 {
+                            let kj = key_e(refs[j].2, refs[j].3);
+                            if (g0..j).any(|k| key_e(refs[k].2, refs[k].3) == kj) {
+                                continue;
+                            }
+                            if outs[refs[j].2 as usize].gev[p][refs[j].3 as usize].valid {
+                                evs.push((refs[j].2, refs[j].3));
                             }
                         }
+                        g0 = g1;
+                    }
+                    drop(refs);
+                    // clicks: copies are identical, keep the first of each ID
+                    let mut refs: Vec<(u64, u16, u32)> = Vec::new();
+                    for (t, o) in outs.iter().enumerate() {
+                        for (i, g) in o.gcl[p].iter().enumerate() {
+                            refs.push((g.hash, t as u16, i as u32));
+                        }
+                    }
+                    refs.sort_unstable_by_key(|r| r.0);
+                    let key_c = |t: u16, i: u32| -> &[u8] {
+                        let g = &outs[t as usize].gcl[p][i as usize];
+                        &arenas[t as usize][g.cid_off as usize..(g.cid_off + g.cid_len) as usize]
+                    };
+                    let mut cls: Vec<(u16, u32)> = Vec::new();
+                    let mut g0 = 0;
+                    while g0 < refs.len() {
+                        let mut g1 = g0;
+                        while g1 < refs.len() && refs[g1].0 == refs[g0].0 {
+                            g1 += 1;
+                        }
+                        for j in g0..g1 {
+                            let kj = key_c(refs[j].1, refs[j].2);
+                            if (g0..j).any(|k| key_c(refs[k].1, refs[k].2) == kj) {
+                                continue;
+                            }
+                            cls.push((refs[j].1, refs[j].2));
+                        }
+                        g0 = g1;
                     }
                     (evs, cls)
                 })
@@ -1708,7 +1741,7 @@ fn run(
     let r1: Vec<(Vec<(usize, Vec<Run>)>, Vec<Vec<Entry>>)> = std::thread::scope(|s| {
         let hs: Vec<_> = (0..nt)
             .map(|_| {
-                let (ev, cl, links, gev_kept, gcl_kept, bits, next_t, sc, spill, spill_range) = (&ev, &cl, &links, &gev_kept, &gcl_kept, &bits, &next_t, &sc, &spill, &spill_range);
+                let (ev, cl, links, gev_kept, gcl_kept, bits, next_t, sc, spill, spill_range, outs) = (&ev, &cl, &links, &gev_kept, &gcl_kept, &bits, &next_t, &sc, &spill, &spill_range, &outs);
                 s.spawn(move || {
                     let mut b: Vec<Vec<Entry>> = (0..NB).map(|_| Vec::new()).collect();
                     let mut done: Vec<(usize, Vec<Run>)> = Vec::new();
@@ -1814,12 +1847,14 @@ fn run(
                         done.push((task, cr));
                     } else {
                     let t = task - nparts - nt;
-                    for (k, (g, _)) in gev_kept[t].iter().enumerate() {
+                    for (k, &(tt, ii)) in gev_kept[t].iter().enumerate() {
+                        let g = &outs[tt as usize].gev[t][ii as usize];
                         let comp = lookup(g.uid);
                         bits.force(comp, EV_HAVE | EV_MULTI);
                         b[bucket_of(comp)].push(Entry { comp, kind: 2, sorted: true, t: t as u16, a: k as u32, b: 0 });
                     }
-                    for (k, (g, _)) in gcl_kept[t].iter().enumerate() {
+                    for (k, &(tt, ii)) in gcl_kept[t].iter().enumerate() {
+                        let g = &outs[tt as usize].gcl[t][ii as usize];
                         let comp = lookup(g.uid);
                         bits.force(comp, CL_HAVE | CL_MULTI);
                         b[bucket_of(comp)].push(Entry { comp, kind: 3, sorted: true, t: t as u16, a: k as u32, b: 0 });
@@ -1977,8 +2012,8 @@ fn run(
             .into_iter()
             .enumerate()
             .map(|(t, mut out)| {
-                let (ev, cl, entries, gev_kept, gcl_kept, next_b, arenas, ud, links) =
-                    (&ev, &cl, &entries, &gev_kept, &gcl_kept, &next_b, &arenas, &ud, &links);
+                let (ev, cl, entries, gev_kept, gcl_kept, next_b, arenas, ud, links, outs) =
+                    (&ev, &cl, &entries, &gev_kept, &gcl_kept, &next_b, &arenas, &ud, &links, &outs);
                 s.spawn(move || {
                     let mut list: Vec<Entry> = Vec::new();
                     let mut evbuf: Vec<Ev> = Vec::new();
@@ -2017,7 +2052,8 @@ fn run(
                                     }
                                     2 => {
                                         nruns += 2;
-                                        let (ge, _) = gev_kept[e.t as usize][e.a as usize];
+                                        let (tt, ii) = gev_kept[e.t as usize][e.a as usize];
+                                        let ge = &outs[tt as usize].gev[e.t as usize][ii as usize];
                                         evbuf.push(Ev { ts: ge.ts, price: ge.price, cat: ge.cat, purchase: ge.purchase });
                                     }
                                     _ => {}
@@ -2033,7 +2069,8 @@ fn run(
                                         decode_clicks(cl, e.a as usize, e.b as usize, ctx, &mut clbuf);
                                     }
                                     3 => {
-                                        let (gc, t) = gcl_kept[e.t as usize][e.a as usize];
+                                        let (t, ii) = gcl_kept[e.t as usize][e.a as usize];
+                                        let gc = &outs[t as usize].gcl[e.t as usize][ii as usize];
                                         clbuf.push(Cl { ts: gc.ts, camp: gc.camp, key: ClKey::Gen(t as u32, gc.cid_off, gc.cid_len) });
                                     }
                                     _ => {}
