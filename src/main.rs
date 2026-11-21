@@ -1722,7 +1722,7 @@ fn run(
     rest.sort_by_key(|c| std::cmp::Reverse(c.3 - c.2));
     chunks.extend(rest);
 
-    ctx.scatter = ctx.pos && std::env::var("SS_ATOMIC").is_err();
+    ctx.scatter = ctx.pos && std::env::var("SS_SCATTER").is_ok();
     if ctx.scatter {
         // partitions of 16K to 64K slots (256 KB to 1 MB of table): placed in cache later
         let span = std::env::var("SS_SPAN").ok().and_then(|v| v.parse().ok()).unwrap_or(((ctx.cap_e / 2) as usize / 1024).next_power_of_two().clamp(1 << 14, 1 << 16));
