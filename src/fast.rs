@@ -102,40 +102,45 @@ fn f3_slow(s: &[u8]) -> Option<i64> {
     Some(v.min(i64::MAX as u64) as i64)
 }
 
-/// Per-thread cache of the last date seen: `YYYY-MM-DD` -> epoch ms of midnight.
+/// Per-thread cache of valid dates: `YYYY-MM-DD` -> epoch ms of midnight,
+/// direct-mapped by a hash of the ten bytes. Only valid dates are cached.
 pub struct DateCache {
-    k8: u64,
-    k2: u16,
-    ms: i64,
+    keys: [(u64, u16); 128],
+    ms: [i64; 128],
 }
 
 impl DateCache {
     pub fn new() -> Self {
-        DateCache { k8: 0, k2: 0, ms: i64::MIN }
+        DateCache { keys: [(0, 0); 128], ms: [0; 128] }
     }
     #[inline(always)]
     fn date(&mut self, s: &[u8]) -> Option<i64> {
         unsafe {
             let k8 = load8(s.as_ptr());
             let k2 = std::ptr::read_unaligned(s.as_ptr().add(8) as *const u16);
-            if k8 == self.k8 && k2 == self.k2 && self.ms != i64::MIN {
-                return Some(self.ms);
+            let h = ((k8 ^ (k2 as u64).wrapping_mul(0x9E37_79B9)).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 57) as usize;
+            let e = self.keys.get_unchecked(h);
+            if e.0 == k8 && e.1 == k2 {
+                return Some(*self.ms.get_unchecked(h));
             }
-            if s[4] != b'-' || s[7] != b'-' {
-                return None;
-            }
-            let y = d2(s[0], s[1])? * 100 + d2(s[2], s[3])?;
-            let mo = d2(s[5], s[6])?;
-            let d = d2(s[8], s[9])?;
-            if !(1..=12).contains(&mo) || d < 1 || d > month_days(y, mo) {
-                return None;
-            }
-            let ms = days_from_civil(y, mo, d) * DAY;
-            self.k8 = k8;
-            self.k2 = k2;
-            self.ms = ms;
-            Some(ms)
+            self.date_slow(s, k8, k2, h)
         }
+    }
+    #[inline(never)]
+    fn date_slow(&mut self, s: &[u8], k8: u64, k2: u16, h: usize) -> Option<i64> {
+        if s[4] != b'-' || s[7] != b'-' {
+            return None;
+        }
+        let y = d2(s[0], s[1])? * 100 + d2(s[2], s[3])?;
+        let mo = d2(s[5], s[6])?;
+        let d = d2(s[8], s[9])?;
+        if !(1..=12).contains(&mo) || d < 1 || d > month_days(y, mo) {
+            return None;
+        }
+        let ms = days_from_civil(y, mo, d) * DAY;
+        self.keys[h] = (k8, k2);
+        self.ms[h] = ms;
+        Some(ms)
     }
     /// `THH:MM:SS` at s[10..19] -> ms of the day.
     #[inline(always)]
