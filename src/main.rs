@@ -669,7 +669,7 @@ struct Scatter {
 unsafe impl Sync for Scatter {}
 unsafe impl Send for Scatter {}
 
-const STAGE: usize = 8;
+const STAGE: usize = 16; // 16 x 20 B = 320 B = five cache lines
 
 impl Scatter {
     fn new(nparts: usize, cap: usize) -> Scatter {
@@ -703,7 +703,20 @@ impl Scatter {
         let n = recs.len();
         let at = self.fill[part].fetch_add(n as u32, Relaxed) as usize;
         if at + n <= self.cap {
-            unsafe { std::ptr::copy_nonoverlapping(recs.as_ptr(), self.buf.add(part * self.cap + at), n) };
+            unsafe {
+                let dst = self.buf.add(part * self.cap + at) as *mut u8;
+                if n == STAGE && (dst as usize) & 31 == 0 {
+                    // a whole batch to a 32-byte boundary: streaming stores, no read of the target lines
+                    use std::arch::x86_64::*;
+                    let src = recs.as_ptr() as *const u8;
+                    for k in 0..(STAGE * 20 / 32) {
+                        let v = _mm256_loadu_si256(src.add(32 * k) as *const __m256i);
+                        _mm256_stream_si256(dst.add(32 * k) as *mut __m256i, v);
+                    }
+                } else {
+                    std::ptr::copy_nonoverlapping(recs.as_ptr(), self.buf.add(part * self.cap + at), n);
+                }
+            }
         } else {
             let mut sp = self.spill.lock().unwrap();
             for (k, r) in recs.iter().enumerate() {
@@ -818,6 +831,7 @@ impl ParseOut {
         }
     }
     fn stage_flush(&mut self, sc: &Scatter) {
+        unsafe { std::arch::x86_64::_mm_sfence() };
         for part in 0..self.stage_n.len() {
             let k = self.stage_n[part] as usize;
             if k > 0 {
@@ -1708,13 +1722,13 @@ fn run(
     rest.sort_by_key(|c| std::cmp::Reverse(c.3 - c.2));
     chunks.extend(rest);
 
-    ctx.scatter = ctx.pos && std::env::var("SS_SCATTER").is_ok();
+    ctx.scatter = ctx.pos && std::env::var("SS_ATOMIC").is_err();
     if ctx.scatter {
         // partitions of 16K to 64K slots (256 KB to 1 MB of table): placed in cache later
-        let span = ((ctx.cap_e / 2) as usize / 1024).next_power_of_two().clamp(1 << 14, 1 << 16);
+        let span = std::env::var("SS_SPAN").ok().and_then(|v| v.parse().ok()).unwrap_or(((ctx.cap_e / 2) as usize / 1024).next_power_of_two().clamp(1 << 14, 1 << 16));
         ctx.shift = span.trailing_zeros() as usize;
         ctx.nparts = ((ctx.cap_e as usize) >> ctx.shift) + 1;
-        ctx.part_cap = span + span / 4 + 64;
+        ctx.part_cap = (span + span / 4 + 64 + 15) & !15; // multiple of 16 records keeps regions 320-byte aligned
     } else if ctx.pos {
         // slot ranges for the run pass
         let target = ((ctx.cap_e / 2) as usize / (4 * nt)).max(1 << 12);
@@ -2125,23 +2139,55 @@ fn run(
                     let mut evbuf: Vec<Ev> = Vec::new();
                     let mut clbuf: Vec<Cl> = Vec::new();
                     let mut cache = CompCache::new();
+                    let mut local: Vec<u64> = if ctx.scatter { vec![0u64; 2 << ctx.shift] } else { Vec::new() };
                     loop {
                         let task = next_t.fetch_add(1, Relaxed);
                         if task >= nparts {
                             break;
                         }
                         let base = task << ctx.shift;
-                        if ctx.scatter {
+                        let evl;
+                        let ev: &Dense = if ctx.scatter {
+                            // place this partition into a local, cache-sized table
+                            unsafe { std::ptr::write_bytes(local.as_mut_ptr(), 0, local.len()) };
+                            let lp = local.as_mut_ptr();
                             let (sa, sb) = spill_range[task];
-                            for r in sc.region(task).iter().chain(spill[sa..sb].iter().map(|x| &x.1)) {
-                                let i = base + r.local as usize;
+                            let reg = sc.region(task);
+                            for r in reg.iter().chain(spill[sa..sb].iter().map(|x| &x.1)) {
+                                let j = 2 * r.local as usize;
                                 let (w0s, w1) = (r.w0s, r.w1);
-                                if w0s > ev.w0(i).load(Relaxed) {
-                                    ev.w0(i).store(w0s, Relaxed);
-                                    ev.w1(i).store(w1, Relaxed);
+                                unsafe {
+                                    if w0s > *lp.add(j) {
+                                        *lp.add(j) = w0s;
+                                        *lp.add(j + 1) = w1;
+                                    }
                                 }
                             }
-                        }
+                            // the global table gets a streamed copy (for the undo and slow paths)
+                            let lo = base.min(max_e).min(ev.len);
+                            let hi = (base + (1 << ctx.shift)).min(max_e).min(ev.len);
+                            if hi > lo {
+                                unsafe {
+                                    use std::arch::x86_64::*;
+                                    let src = lp as *const u8;
+                                    let dst = ev.ptr.add(2 * lo) as *mut u8;
+                                    let bytes = (hi - lo) * 16;
+                                    let mut k = 0;
+                                    while k + 32 <= bytes {
+                                        _mm256_stream_si256(dst.add(k) as *mut __m256i, _mm256_loadu_si256(src.add(k) as *const __m256i));
+                                        k += 32;
+                                    }
+                                    if k < bytes {
+                                        std::ptr::copy_nonoverlapping(src.add(k), dst.add(k), bytes - k);
+                                    }
+                                    _mm_sfence();
+                                }
+                            }
+                            evl = Dense { ptr: (lp as *mut AtomicU64).wrapping_sub(2 * base), len: ev.len };
+                            &evl
+                        } else {
+                            ev
+                        };
                         let lo = base.min(max_e);
                         let hi = (base + (1 << ctx.shift)).min(max_e);
                         let mut ci = usize::MAX; // click cursor, placed at the first run
