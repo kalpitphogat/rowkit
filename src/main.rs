@@ -1953,7 +1953,8 @@ fn run(
                             let c = cr_all[found];
                             decode_clicks(cl, c.a as usize, c.b as usize, ctx, &mut clbuf);
                             if clbuf.len() > 1 {
-                                clbuf.sort_by(|a, b| click_cmp_refs(a, b, arenas));
+                                // canonical IDs only: their name keys order like the strings
+                                clbuf.sort_unstable_by_key(|c| (c.ts, match c.key { ClKey::Canon(m) => name_key(m), ClKey::Gen(..) => 0 }));
                             }
                         }
                         process_person(ctx, r.comp, &evbuf, &clbuf, &mut out);
@@ -2141,6 +2142,9 @@ fn run(
 
 fn click_cmp_refs(a: &Cl, b: &Cl, arenas: &[&Vec<u8>]) -> std::cmp::Ordering {
     a.ts.cmp(&b.ts).then_with(|| {
+        if let (ClKey::Canon(x), ClKey::Canon(y)) = (a.key, b.key) {
+            return name_key(x).cmp(&name_key(y));
+        }
         let mut sa = Vec::new();
         let mut sb = Vec::new();
         let bytes = |k: &ClKey, s: &mut Vec<u8>| match *k {
