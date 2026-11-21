@@ -61,6 +61,16 @@ pub fn lines<const N: usize>(data: &[u8], start: usize, end: usize, mut f: impl 
         if k != N - 1 || le == ls {
             return;
         }
+        if q == 0 {
+            // no quote anywhere on the line: fields are the raw spans
+            for i in 0..N {
+                let s = if i == 0 { ls } else { seps[i - 1] + 1 };
+                let e = if i == N - 1 { le } else { seps[i] };
+                fl[i] = unsafe { std::slice::from_raw_parts(ptr.add(s), e - s) };
+            }
+            f(fl);
+            return;
+        }
         let mut expect = 0u32;
         for i in 0..N {
             let s = if i == 0 { ls } else { seps[i - 1] + 1 };

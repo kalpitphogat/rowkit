@@ -928,9 +928,9 @@ fn parse_event(f: &[&[u8]; 7], ctx: &Ctx, ev: &Dense, sc: &Scatter, out: &mut Pa
     if eid.is_empty() {
         return;
     }
-    let ingest = out.dc.ts(f[3]).unwrap_or(i64::MAX);
+    let (ts, ingest) = out.dc.ts_pair(f[2], f[3]);
+    let ingest = ingest.unwrap_or(i64::MAX);
     let mut valid = !f[1].is_empty() && !f[5].is_empty();
-    let ts = out.dc.ts(f[2]);
     let ts = match ts {
         Some(t) if t >= ctx.ws && t < ctx.we => t,
         _ => {

@@ -170,6 +170,33 @@ impl DateCache {
             Some(((h * 60 + m) * 60 + sec) * 1000)
         }
     }
+    /// `(ts, ingest_ts)` of an event line. When `ingest_ts` is F1 and `ts` (F1 or F2)
+    /// starts with the same date, that date is looked up once. Same results as two `ts` calls.
+    #[inline(always)]
+    pub fn ts_pair(&mut self, ts: &[u8], ing: &[u8]) -> (Option<i64>, Option<i64>) {
+        if ing.len() == 20 && ing[19] == b'Z' {
+            let ti = Self::time(ing);
+            let di = self.date(ing);
+            let ingest = match (di, ti) {
+                (Some(d), Some(t)) => Some(d + t),
+                _ => None,
+            };
+            let n = ts.len();
+            if let Some(d) = di {
+                if (n == 20 || n == 25) && ts[..10] == ing[..10] {
+                    let t = if n == 20 {
+                        if ts[19] == b'Z' { Self::time(ts).map(|t| d + t) } else { f3_fast(ts) }
+                    } else {
+                        return (self.ts(ts), ingest);
+                    };
+                    return (t, ingest);
+                }
+            }
+            return (self.ts(ts), ingest);
+        }
+        (self.ts(ts), self.ts(ing))
+    }
+
     /// `ts` in forms F1, F2 or F3, with the cache; None for a bad timestamp.
     #[inline(always)]
     pub fn ts(&mut self, s: &[u8]) -> Option<i64> {
@@ -339,6 +366,27 @@ mod canon10_tests {
             let f = &buf[at..at + c.len()];
             assert_eq!(canon10_fast(f, b"p"), canon10(c, b"p"), "{:?}", String::from_utf8_lossy(c));
             assert_eq!(canon10_fast(f, b"c_"), canon10(c, b"c_"), "{:?}", String::from_utf8_lossy(c));
+        }
+    }
+}
+
+#[cfg(test)]
+mod pair_tests {
+    use super::*;
+    #[test]
+    fn pair_matches_single() {
+        let ts: &[&[u8]] = &[b"2026-10-03T23:58:10Z", b"2026-10-03T19:58:10-04:00", b"2026-10-03T19:58:10+24:00", b"1791071890000", b"2026-10-03T24:00:00Z", b"2026-10-03 23:58:10Z", b"2026-10-03T23:58:10z", b"2026-10-04T00:00:00Z", b"2026-02-29T01:00:00Z", b"", b"2026-10-03T23:58:10.000Z", b"12345678901234567890"];
+        let ing: &[&[u8]] = &[b"2026-10-03T23:59:10Z", b"2026-10-04T00:00:01Z", b"2026-02-29T01:00:00Z", b"2026-10-03T23:5x:10Z", b"garbage", b"2026-10-03T23:59:10+01:00"];
+        let mut buf = vec![b'x'; 128];
+        for t in ts {
+            for i in ing {
+                buf[40..40 + t.len()].copy_from_slice(t);
+                buf[80..80 + i.len()].copy_from_slice(i);
+                let (ft, fi) = (&buf[40..40 + t.len()], &buf[80..80 + i.len()]);
+                let mut a = DateCache::new();
+                let mut b = DateCache::new();
+                assert_eq!(a.ts_pair(ft, fi), (b.ts(ft), b.ts(fi)), "{:?} {:?}", String::from_utf8_lossy(t), String::from_utf8_lossy(i));
+            }
         }
     }
 }
