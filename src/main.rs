@@ -271,8 +271,7 @@ struct Links {
     tab: Vec<u64>,
     shard_shift: u32, // shard = hash >> shard_shift
     shard_bits: u32,  // log2 of the entries per shard
-    root: Vec<u32>,
-    name: Vec<u64>, // per root: uid enc of the smallest ID
+    name: Vec<u64>, // per linked ID: uid enc of the smallest ID of its set
 }
 
 const IDX_BITS: u32 = 23;
@@ -422,9 +421,9 @@ impl Links {
         for i in 0..n {
             root[i] = find(&mut node, i as u32);
         }
-        let name = ids;
+        let name: Vec<u64> = root.iter().map(|&r| ids[r as usize]).collect();
         stamp(&format!("names ({} ids, {} occurrences)", n, occ));
-        Links { tab, shard_shift, shard_bits, root, name }
+        Links { tab, shard_shift, shard_bits, name }
     }
 
     /// The person of a user ID: LINK_TAG | root for a linked ID, the ID itself otherwise.
@@ -439,7 +438,8 @@ impl Links {
         loop {
             let e = unsafe { *self.tab.get_unchecked(base + h) };
             if e >> IDX_BITS == want {
-                return LINK_TAG | unsafe { *self.root.get_unchecked((e & ((1 << IDX_BITS) - 1)) as usize) } as u64;
+                // a set is named by its smallest ID, which also serves as its identity
+                return LINK_TAG | unsafe { *self.name.get_unchecked((e & ((1 << IDX_BITS) - 1)) as usize) };
             }
             if e == 0 {
                 return uid;
@@ -449,11 +449,7 @@ impl Links {
     }
 
     fn name_of(&self, comp: u64) -> u64 {
-        if comp & LINK_TAG != 0 {
-            self.name[(comp & 0xFFFF_FFFF) as usize]
-        } else {
-            comp
-        }
+        comp & !LINK_TAG
     }
 }
 
