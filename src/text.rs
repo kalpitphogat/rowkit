@@ -233,17 +233,34 @@ pub fn canon36(s: &[u8], prefix: u8) -> Option<u64> {
     Some(v)
 }
 
+/// Two base-36 digits per entry: PAIRS[v] for v < 1296 is digit(v / 36), digit(v % 36).
+static PAIRS: [[u8; 2]; 1296] = {
+    let d = b"0123456789abcdefghijklmnopqrstuvwxyz";
+    let mut t = [[0u8; 2]; 1296];
+    let mut i = 0;
+    while i < 1296 {
+        t[i] = [d[i / 36], d[i % 36]];
+        i += 1;
+    }
+    t
+};
+
 pub fn base36_string(prefix: u8, mut v: u64, out: &mut Vec<u8>) {
-    const D: &[u8; 36] = b"0123456789abcdefghijklmnopqrstuvwxyz";
     let mut buf = [0u8; 16];
     let mut at = buf.len();
+    // two digits per step, then drop a leading zero digit (none when v is 0)
     loop {
-        at -= 1;
-        buf[at] = D[(v % 36) as usize];
-        v /= 36;
+        let p = PAIRS[(v % 1296) as usize];
+        at -= 2;
+        buf[at] = p[0];
+        buf[at + 1] = p[1];
+        v /= 1296;
         if v == 0 {
             break;
         }
+    }
+    if buf[at] == b'0' && at + 1 < buf.len() {
+        at += 1;
     }
     out.push(prefix);
     out.extend_from_slice(&buf[at..]);
@@ -315,6 +332,28 @@ pub fn scramble(value: u64, key: u64) -> u64 {
     mixed = (mixed.wrapping_mul(M1) ^ key) & MASK40;
     mixed ^= mixed >> 17;
     mixed.wrapping_mul(M2) & MASK40
+}
+
+#[cfg(test)]
+mod b36_tests {
+    #[test]
+    fn pairs_match_simple() {
+        let d = b"0123456789abcdefghijklmnopqrstuvwxyz";
+        let mut x: u64 = 88172645463325252;
+        for i in 0..2_000_000u64 {
+            x ^= x << 13; x ^= x >> 7; x ^= x << 17;
+            let v = if i < 5000 { i } else { (x % (1u64 << 41)) >> (i % 41) };
+            let mut want = vec![b'u'];
+            let mut tmp = Vec::new();
+            let mut w = v;
+            loop { tmp.push(d[(w % 36) as usize]); w /= 36; if w == 0 { break; } }
+            tmp.reverse();
+            want.extend_from_slice(&tmp);
+            let mut got = Vec::new();
+            super::base36_string(b'u', v, &mut got);
+            assert_eq!(got, want, "v={v}");
+        }
+    }
 }
 
 #[cfg(test)]

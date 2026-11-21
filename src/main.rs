@@ -268,6 +268,65 @@ fn canon_key(mut v: u64) -> u64 {
     u64::from_be_bytes(buf)
 }
 
+
+// ---------------------------------------------------------------- cpu pinning
+
+/// Allowed CPUs, hyperthread siblings next to each other, so threads 2k and 2k+1 share a core.
+fn cpu_order() -> &'static Vec<usize> {
+    static O: std::sync::OnceLock<Vec<usize>> = std::sync::OnceLock::new();
+    O.get_or_init(|| {
+        if std::env::var("SS_PIN").map(|v| v == "0").unwrap_or(false) {
+            return Vec::new();
+        }
+        let mut set: libc::cpu_set_t = unsafe { std::mem::zeroed() };
+        if unsafe { libc::sched_getaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &mut set) } != 0 {
+            return Vec::new();
+        }
+        let allowed: Vec<usize> = (0..libc::CPU_SETSIZE as usize).filter(|&c| unsafe { libc::CPU_ISSET(c, &set) }).collect();
+        let mut seen = std::collections::HashSet::new();
+        let mut out = Vec::new();
+        for &c in &allowed {
+            if seen.contains(&c) {
+                continue;
+            }
+            let sib = std::fs::read_to_string(format!("/sys/devices/system/cpu/cpu{c}/topology/thread_siblings_list")).unwrap_or_default();
+            let mut grp = vec![c];
+            for part in sib.trim().split(',') {
+                let mut it = part.split('-').filter_map(|x| x.parse::<usize>().ok());
+                if let Some(a) = it.next() {
+                    for x in a..=it.next().unwrap_or(a).min(4095) {
+                        if x != c {
+                            grp.push(x);
+                        }
+                    }
+                }
+            }
+            for x in grp {
+                if allowed.contains(&x) && seen.insert(x) {
+                    out.push(x);
+                }
+            }
+        }
+        out
+    })
+}
+
+static PIN_NEXT: AtomicUsize = AtomicUsize::new(0);
+
+/// Pins the calling worker to the next CPU in `cpu_order` (round robin).
+fn pin_self() {
+    let o = cpu_order();
+    if o.len() < 2 {
+        return;
+    }
+    let c = o[PIN_NEXT.fetch_add(1, Relaxed) % o.len()];
+    unsafe {
+        let mut set: libc::cpu_set_t = std::mem::zeroed();
+        libc::CPU_SET(c, &mut set);
+        libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &set);
+    }
+}
+
 // ---------------------------------------------------------------- union-find over linked ids
 
 #[derive(Clone, Copy)]
@@ -1803,6 +1862,7 @@ fn run(
             let (ev, cl, sc) = (&ev, &cl, &sc);
             let (next, chunks, link_pairs, links_done, remaining, lfd, efd, cfd, build_uf) = (&next, &chunks, &link_pairs, &links_done, &remaining, &lfd, &efd, &cfd, &build_uf);
             hs.push(s.spawn(move || {
+                pin_self();
                 let mut out = ParseOut {
                     links: Vec::new(),
                     gev: (0..nt).map(|_| Vec::new()).collect(),
@@ -1946,6 +2006,7 @@ fn run(
                 let outs = &outs;
                 let arenas = &arenas;
                 s.spawn(move || {
+                pin_self();
                     // events: sort by (hash, ingest); the first copy of each ID is the one kept
                     let mut refs: Vec<(u64, i64, u16, u32)> = Vec::new();
                     for (t, o) in outs.iter().enumerate() {
@@ -2018,6 +2079,7 @@ fn run(
         for o in &outs {
             let ev = &ev;
             s.spawn(move || {
+                pin_self();
                 for &(slot, w0s, w1) in &o.overflow {
                     if ev.w0(slot as usize).load(Relaxed) == w0s {
                         ev.w1(slot as usize).store(w1, Relaxed);
@@ -2060,6 +2122,7 @@ fn run(
             .map(|t| {
                 let (cl, links, gev_kept, gcl_kept, bits, outs, pbits, clcnt) = (&cl, &links, &gev_kept, &gcl_kept, &bits, &outs, &pbits, &clcnt);
                 s.spawn(move || {
+                pin_self();
                     let mut b: Vec<Vec<Entry>> = (0..NB).map(|_| Vec::new()).collect();
                     let mut cr: Vec<Run> = Vec::new();
                     let mut cache = CompCache::new();
@@ -2153,6 +2216,7 @@ fn run(
                 let (ev, cl, links, bits, cr_all, consumed, next_t, sc, spill, spill_range, pbits, clcnt) =
                     (&ev, &cl, &links, &bits, &cr_all, &consumed, &next_t, &sc, &spill, &spill_range, &pbits, &clcnt);
                 s.spawn(move || {
+                pin_self();
                     let mut out = new_out(ctx);
                     let mut b: Vec<Vec<Entry>> = (0..NB).map(|_| Vec::new()).collect();
                     let mut procs: Vec<Proc> = Vec::new();
@@ -2352,6 +2416,7 @@ fn run(
             .map(|(mut out, mut b, procs)| {
                 let (ev, cl, bits, cr_all, consumed, pbits) = (&ev, &cl, &bits, &cr_all, &consumed, &pbits);
                 s.spawn(move || {
+                pin_self();
                     let mut evbuf: Vec<Ev> = Vec::new();
                     let mut clbuf: Vec<Cl> = Vec::new();
                     for p in &procs {
@@ -2397,6 +2462,7 @@ fn run(
             .map(|t| {
                 let (cr_all, consumed) = (&cr_all, &consumed);
                 s.spawn(move || {
+                pin_self();
                     let mut b: Vec<Vec<Entry>> = (0..NB).map(|_| Vec::new()).collect();
                     let lo = cr_all.len() * t / nt;
                     let hi = cr_all.len() * (t + 1) / nt;
@@ -2432,6 +2498,7 @@ fn run(
                 let (ev, cl, entries, gev_kept, gcl_kept, next_b, arenas, ud, links, outs) =
                     (&ev, &cl, &entries, &gev_kept, &gcl_kept, &next_b, &arenas, &ud, &links, &outs);
                 s.spawn(move || {
+                pin_self();
                     let mut list: Vec<Entry> = Vec::new();
                     let mut evbuf: Vec<Ev> = Vec::new();
                     let mut clbuf: Vec<Cl> = Vec::new();
