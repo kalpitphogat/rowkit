@@ -1767,12 +1767,22 @@ fn run(
     let link_pairs: Mutex<Vec<Vec<(u64, u64)>>> = Mutex::new(Vec::new());
     let ctxr = &ctx;
 
+    let uf_slot: Mutex<Option<Links>> = Mutex::new(None);
+    let build_uf = || {
+        let pairs = std::mem::take(&mut *link_pairs.lock().unwrap());
+        let tb = Instant::now();
+        let l = Links::build(pairs, if ctx.pos { Some((ctx.mix, ctx.ukey)) } else { None });
+        if timing {
+            eprintln!("   union-find {:.1} ms", tb.elapsed().as_secs_f64() * 1e3);
+        }
+        *uf_slot.lock().unwrap() = Some(l);
+    };
     let (outs, links): (Vec<ParseOut>, Links) = std::thread::scope(|s| {
         let mut hs = Vec::new();
         for me in 0..nt {
             let mail = &mail;
             let (ev, cl, sc) = (&ev, &cl, &sc);
-            let (next, chunks, link_pairs, links_done, remaining, lfd, efd, cfd) = (&next, &chunks, &link_pairs, &links_done, &remaining, &lfd, &efd, &cfd);
+            let (next, chunks, link_pairs, links_done, remaining, lfd, efd, cfd, build_uf) = (&next, &chunks, &link_pairs, &links_done, &remaining, &lfd, &efd, &cfd, &build_uf);
             hs.push(s.spawn(move || {
                 let mut out = ParseOut {
                     links: Vec::new(),
@@ -1803,7 +1813,9 @@ fn run(
                     if i >= nlink && !did_links {
                         did_links = true;
                         link_pairs.lock().unwrap().push(std::mem::take(&mut out.links));
-                        links_done.fetch_add(1, Relaxed);
+                        if links_done.fetch_add(1, Relaxed) + 1 == nt {
+                            build_uf();
+                        }
                     }
                     let (kind, fi, a0, b0) = chunks[i];
                     let (fset, fds) = match kind {
@@ -1880,26 +1892,15 @@ fn run(
                 out.flush_clicks(&cl);
                 if !did_links {
                     link_pairs.lock().unwrap().push(std::mem::take(&mut out.links));
-                    links_done.fetch_add(1, Relaxed);
+                    if links_done.fetch_add(1, Relaxed) + 1 == nt {
+                        build_uf();
+                    }
                 }
                 out
             }));
         }
-        // union-find on this thread once every worker has handed over its links
-        let uf = s.spawn(|| {
-            while links_done.load(Relaxed) < nt {
-                std::thread::sleep(std::time::Duration::from_micros(200));
-            }
-            let pairs = std::mem::take(&mut *link_pairs.lock().unwrap());
-            let tb = Instant::now();
-            let l = Links::build(pairs, if ctxr.pos { Some((ctxr.mix, ctxr.ukey)) } else { None });
-            if timing {
-                eprintln!("   union-find {:.1} ms", tb.elapsed().as_secs_f64() * 1e3);
-            }
-            l
-        });
         let outs = hs.into_iter().map(|h| h.join().unwrap()).collect();
-        (outs, uf.join().unwrap())
+        (outs, uf_slot.lock().unwrap().take().expect("links"))
     });
     lap("parse + links");
 
