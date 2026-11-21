@@ -1240,6 +1240,27 @@ fn new_out(ctx: &Ctx) -> Out {
     }
 }
 
+fn write_users(path: &Path, users: &[UserRow], ctx: &Ctx, links: &Links) {
+    let n = users.len();
+    let mut c_user = parquet::Column::new(names::A_ID, parquet::Kind::Str, n);
+    let mut c_day = parquet::Column::new(names::DAY, parquet::Kind::Date, n);
+    let mut c_s = parquet::Column::new(names::N_S, parquet::Kind::I64, n);
+    let mut c_e = parquet::Column::new(names::N_E, parquet::Kind::I64, n);
+    let mut c_r = parquet::Column::new(names::REV, parquet::Kind::I64, n);
+    let mut c_t = parquet::Column::new(names::TOP, parquet::Kind::OptStr, n);
+    let mut buf = Vec::new();
+    for r in users {
+        uid_bytes(links.name_of(r.comp), &mut buf);
+        c_user.push_str(&buf);
+        c_day.push_i32(r.day);
+        c_s.push_i64(r.sessions as i64);
+        c_e.push_i64(r.events as i64);
+        c_r.push_i64(r.revenue as i64);
+        c_t.push_opt(if r.top == u16::MAX { None } else { Some(&ctx.cats[r.top as usize]) });
+    }
+    parquet::write(path, &[c_user, c_day, c_s, c_e, c_r, c_t]).expect("write");
+}
+
 // ---------------------------------------------------------------- person buckets
 
 #[derive(Clone, Copy)]
@@ -1942,6 +1963,11 @@ fn run(
             DBG[0].load(Relaxed), DBG[1].load(Relaxed), DBG[2].load(Relaxed), DBG[3].load(Relaxed), DBG[4].load(Relaxed), DBG[5].load(Relaxed), cr_all.len());
     }
 
+    let ud = out_dir.join(names::OUT_A);
+    let cd = out_dir.join(names::OUT_B);
+    let _ = std::fs::create_dir_all(&ud);
+    let _ = std::fs::create_dir_all(&cd);
+
     // per-bucket person processing
     let ncamp = ctx.camp_names.len();
     let ndays = ctx.ndays;
@@ -1949,9 +1975,10 @@ fn run(
     let outs2: Vec<Out> = std::thread::scope(|s| {
         let hs: Vec<_> = fast_outs
             .into_iter()
-            .map(|mut out| {
-                let (ev, cl, entries, gev_kept, gcl_kept, next_b, arenas) =
-                    (&ev, &cl, &entries, &gev_kept, &gcl_kept, &next_b, &arenas);
+            .enumerate()
+            .map(|(t, mut out)| {
+                let (ev, cl, entries, gev_kept, gcl_kept, next_b, arenas, ud, links) =
+                    (&ev, &cl, &entries, &gev_kept, &gcl_kept, &next_b, &arenas, &ud, &links);
                 s.spawn(move || {
                     let mut list: Vec<Entry> = Vec::new();
                     let mut evbuf: Vec<Ev> = Vec::new();
@@ -2020,6 +2047,9 @@ fn run(
                             }
                         }
                     }
+                    // this thread's rows go straight to their own file
+                    write_users(&ud.join(format!("part-{t}.parquet")), &out.users, ctx, links);
+                    out.users = Vec::new();
                     out
                 })
             })
@@ -2028,36 +2058,8 @@ fn run(
     });
     lap("sessions");
 
-    // outputs
-    let ud = out_dir.join(names::OUT_A);
-    let cd = out_dir.join(names::OUT_B);
-    let _ = std::fs::create_dir_all(&ud);
-    let _ = std::fs::create_dir_all(&cd);
-    std::thread::scope(|s| {
-        for (t, o) in outs2.iter().enumerate() {
-            let ud = &ud;
-            let links = &links;
-            s.spawn(move || {
-                let n = o.users.len();
-                let mut c_user = parquet::Column::new(names::A_ID, parquet::Kind::Str, n);
-                let mut c_day = parquet::Column::new(names::DAY, parquet::Kind::Date, n);
-                let mut c_s = parquet::Column::new(names::N_S, parquet::Kind::I64, n);
-                let mut c_e = parquet::Column::new(names::N_E, parquet::Kind::I64, n);
-                let mut c_r = parquet::Column::new(names::REV, parquet::Kind::I64, n);
-                let mut c_t = parquet::Column::new(names::TOP, parquet::Kind::OptStr, n);
-                let mut buf = Vec::new();
-                for r in &o.users {
-                    uid_bytes(links.name_of(r.comp), &mut buf);
-                    c_user.push_str(&buf);
-                    c_day.push_i32(r.day);
-                    c_s.push_i64(r.sessions as i64);
-                    c_e.push_i64(r.events as i64);
-                    c_r.push_i64(r.revenue as i64);
-                    c_t.push_opt(if r.top == u16::MAX { None } else { Some(&ctx.cats[r.top as usize]) });
-                }
-                parquet::write(&ud.join(format!("part-{t}.parquet")), &[c_user, c_day, c_s, c_e, c_r, c_t]).expect("write");
-            });
-        }
+    // second table
+    {
         // second table on this thread
         let mut tot = vec![[0u64; 4]; (ncamp + 1) * ndays];
         for o in &outs2 {
@@ -2095,7 +2097,7 @@ fn run(
             }
         }
         parquet::write(&cd.join("part-0.parquet"), &[c_id, c_ch, c_day, c_s, c_p, c_r, c_a]).expect("write");
-    });
+    }
     lap("output");
     unsafe { libc::_exit(0) };
 }
