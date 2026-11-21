@@ -866,10 +866,12 @@ fn parse_click(f: &[&[u8]; 4], ctx: &Ctx, cl: &Dense, out: &mut ParseOut, nt: us
 
 // ---------------------------------------------------------------- key discovery
 
-fn sample_lines(files: &[(PathBuf, &'static [u8])], per_file: usize, nfields: usize) -> Vec<Vec<Vec<u8>>> {
+fn sample_lines(files: &[(PathBuf, &'static [u8])], per_file: usize, nfields: usize) -> (Vec<Vec<Vec<u8>>>, f64) {
     let mut idx: Vec<usize> = (0..files.len()).collect();
     idx.sort_by_key(|&i| std::cmp::Reverse(files[i].1.len()));
     let mut rows = Vec::new();
+    let mut bytes = 0usize;
+    let mut lines = 0usize;
     for &i in idx.iter().take(4) {
         let d = files[i].1;
         let end = d.len().min(per_file);
@@ -884,12 +886,15 @@ fn sample_lines(files: &[(PathBuf, &'static [u8])], per_file: usize, nfields: us
                     ok
                 }
             };
+            bytes += line.len() + 1;
+            lines += 1;
             if ok {
-                rows.push(f[..nfields].iter().map(|x| x.to_vec()).collect());
+                rows.push(vec![f[0].to_vec(), f[1].to_vec()]);
             }
         });
     }
-    rows
+    let avg = if lines == 0 { 60.0 } else { bytes as f64 / lines as f64 };
+    (rows, avg)
 }
 
 /// Finds the ID keys from a sample, or None. Never affects correctness, only speed.
@@ -1275,49 +1280,66 @@ fn main() {
     let day0 = ws.div_euclid(DAY);
     let ndays = ((we - 1).div_euclid(DAY) - day0 + 1).max(1) as usize;
 
-    // products and categories
-    let mut prod_rows: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
-    read_small_csv(&data_dir.join(names::F_P), |a, b| prod_rows.push((a.to_vec(), b.to_vec())));
-    let mut cats: Vec<Vec<u8>> = prod_rows.iter().map(|r| r.1.clone()).collect();
-    cats.push(names::UNK.to_vec());
-    cats.sort();
-    cats.dedup();
-    let cat_idx: HashMap<Vec<u8>, u16> = cats.iter().enumerate().map(|(i, c)| (c.clone(), i as u16)).collect();
-    let unknown_cat = cat_idx[names::UNK];
-    let mut prod_dense: Vec<u16> = Vec::new();
-    let mut prod_map: HashMap<Vec<u8>, u16> = HashMap::new();
-    for (p, c) in &prod_rows {
-        let ci = cat_idx[c];
-        prod_map.insert(p.clone(), ci);
-        if let Some(n) = canon10(p, b"p") {
-            if n < 10_000_000 {
-                if prod_dense.len() <= n as usize {
-                    prod_dense.resize(n as usize + 1, 0);
+    // products and campaigns load on a helper thread while the inputs are mapped and sampled
+    let lookups = std::thread::spawn({
+        let data_dir = data_dir.clone();
+        move || {
+        // products and categories: canonical IDs ("p" + number) go to a dense table,
+        // any other spelling to a map; categories are numbered after sorting
+        let mut cat_names: Vec<Vec<u8>> = Vec::new();
+        let mut dense_tmp: Vec<u16> = Vec::new();
+        let mut odd_tmp: Vec<(Vec<u8>, u16)> = Vec::new();
+        read_small_csv(&data_dir.join(names::F_P), |p, c| {
+            let ci = match cat_names.iter().position(|x| x.as_slice() == c) {
+                Some(i) => i,
+                None => {
+                    cat_names.push(c.to_vec());
+                    cat_names.len() - 1
                 }
-                prod_dense[n as usize] = ci + 1;
+            } as u16;
+            match canon10(p, b"p") {
+                Some(n) if n < 10_000_000 => {
+                    if dense_tmp.len() <= n as usize {
+                        dense_tmp.resize(n as usize + 1, 0);
+                    }
+                    dense_tmp[n as usize] = ci + 1;
+                }
+                _ => odd_tmp.push((p.to_vec(), ci)),
+            }
+        });
+        let mut cats: Vec<Vec<u8>> = cat_names.clone();
+        cats.push(names::UNK.to_vec());
+        cats.sort();
+        cats.dedup();
+        let remap: Vec<u16> = cat_names.iter().map(|c| cats.binary_search(c).unwrap() as u16).collect();
+        let unknown_cat = cats.binary_search(&names::UNK.to_vec()).unwrap() as u16;
+        let prod_dense: Vec<u16> = dense_tmp.iter().map(|&v| if v == 0 { 0 } else { remap[v as usize - 1] + 1 }).collect();
+        let prod_map: HashMap<Vec<u8>, u16> = odd_tmp.into_iter().map(|(p, ci)| (p, remap[ci as usize])).collect();
+        // campaigns
+        let mut camp_names = Vec::new();
+        let mut camp_channels = Vec::new();
+        read_small_csv(&data_dir.join(names::F_C), |a, b| {
+            camp_names.push(a.to_vec());
+            camp_channels.push(b.to_vec());
+        });
+        let mut camp_dense: Vec<u16> = Vec::new();
+        let mut camp_map: HashMap<Vec<u8>, u16> = HashMap::new();
+        for (i, c) in camp_names.iter().enumerate() {
+            match canon10(c, b"c_") {
+                Some(n) if n < 10_000_000 => {
+                    if camp_dense.len() <= n as usize {
+                        camp_dense.resize(n as usize + 1, 0);
+                    }
+                    camp_dense[n as usize] = i as u16 + 1;
+                }
+                _ => {
+                    camp_map.insert(c.clone(), i as u16);
+                }
             }
         }
-    }
-    // campaigns
-    let mut camp_names = Vec::new();
-    let mut camp_channels = Vec::new();
-    read_small_csv(&data_dir.join(names::F_C), |a, b| {
-        camp_names.push(a.to_vec());
-        camp_channels.push(b.to_vec());
+            (cats, unknown_cat, prod_dense, prod_map, camp_names, camp_channels, camp_dense, camp_map)
+        }
     });
-    let mut camp_dense: Vec<u16> = Vec::new();
-    let mut camp_map: HashMap<Vec<u8>, u16> = HashMap::new();
-    for (i, c) in camp_names.iter().enumerate() {
-        camp_map.insert(c.clone(), i as u16);
-        if let Some(n) = canon10(c, b"c_") {
-            if n < 10_000_000 {
-                if camp_dense.len() <= n as usize {
-                    camp_dense.resize(n as usize + 1, 0);
-                }
-                camp_dense[n as usize] = i as u16 + 1;
-            }
-        }
-    }
 
     let map_all = |sub: &str| -> Vec<(PathBuf, &'static [u8])> {
         list_csv(&data_dir.join(sub)).into_iter().map(|p| {
@@ -1333,19 +1355,16 @@ fn main() {
     let mix = Mix::new();
     let ev_bytes: usize = event_files.iter().map(|f| f.1.len()).sum();
     let cl_bytes: usize = click_files.iter().map(|f| f.1.len()).sum();
-    let ev_sample = sample_lines(&event_files, 256 << 10, 7);
-    let cl_sample = sample_lines(&click_files, 256 << 10, 4);
-    let avg = |rows: &Vec<Vec<Vec<u8>>>, n: usize| -> f64 {
-        if rows.is_empty() {
-            return 60.0;
-        }
-        let tot: usize = rows.iter().map(|r| r.iter().map(|f| f.len()).sum::<usize>() + n).sum();
-        tot as f64 / rows.len() as f64
-    };
-    let est_e = (ev_bytes as f64 / avg(&ev_sample, 7)) as u64;
-    let est_c = (cl_bytes as f64 / avg(&cl_sample, 4)) as u64;
+    lap("mapped");
+    let (ev_sample, ev_avg) = sample_lines(&event_files, 128 << 10, 7);
+    let (cl_sample, cl_avg) = sample_lines(&click_files, 128 << 10, 4);
+    let est_e = (ev_bytes as f64 / ev_avg) as u64;
+    let est_c = (cl_bytes as f64 / cl_avg) as u64;
     let mut pos = false;
     let (mut ekey, mut ckey, mut ukey) = (0, 0, 0);
+    lap("sampled");
+    let (cats, unknown_cat, prod_dense, prod_map, camp_names, camp_channels, camp_dense, camp_map) = lookups.join().unwrap();
+    lap("lookups joined");
     let ncamp = camp_names.len();
     if !force_generic && (we - ws) <= 17 * DAY && cats.len() <= 31 && ncamp < 4095 {
         if let Some((a, b, c)) = find_keys(&mix, &ev_sample, &cl_sample, est_e, est_c) {

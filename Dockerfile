@@ -9,5 +9,6 @@ RUN cargo build --release --target x86_64-unknown-linux-gnu \
 
 FROM scratch
 COPY --from=build /rowkit /rowkit
+ENV GLIBC_TUNABLES=glibc.malloc.hugetlb=1
 USER 1000:1000
 CMD ["/rowkit"]
