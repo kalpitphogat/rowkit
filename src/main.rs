@@ -270,11 +270,24 @@ fn canon_key(mut v: u64) -> u64 {
 
 // ---------------------------------------------------------------- union-find over linked ids
 
+#[derive(Clone, Copy)]
+struct PInfo {
+    comp: u64,
+    mask: u8,
+    amb: bool,
+}
+
 struct Links {
     // Sharded open addressing. Entry = (key+1) << IDX_BITS | index; 0 = empty.
     tab: Vec<u64>,
     shard_shift: u32, // shard = hash >> shard_shift
     shard_bits: u32,  // log2 of the entries per shard
+    // Per generator person p (canonical IDs decoded with the user key): which of its
+    // aliases 0..8 are linked, and the name of their set. Read in person order, so
+    // mostly sequential. Anything it cannot answer exactly goes to the hash table.
+    pinfo: Vec<PInfo>,
+    pcap: u64, // persons below this are covered: an alias < 8 missing from the mask is unlinked
+    pkey: Option<(Mix, u64)>,
     name: Vec<u64>, // per linked ID: uid enc of the smallest ID of its set
 }
 
@@ -303,7 +316,7 @@ fn huge_zeroed(n: usize) -> Vec<u64> {
 }
 
 impl Links {
-    fn build(pairs: Vec<Vec<(u64, u64)>>) -> Links {
+    fn build(pairs: Vec<Vec<(u64, u64)>>, pkey: Option<(Mix, u64)>) -> Links {
         let show = std::env::var("SS_TIMING").is_ok();
         let cpu = || -> f64 {
             let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
@@ -426,8 +439,64 @@ impl Links {
             root[i] = find(&mut node, i as u32);
         }
         let name: Vec<u64> = root.iter().map(|&r| ids[r as usize]).collect();
+        let name_ids = ids;
         stamp(&format!("names ({} ids, {} occurrences)", n, occ));
-        Links { tab, shard_shift, shard_bits, name }
+        let mut pinfo: Vec<PInfo> = Vec::new();
+        let pcap: u64 = 1 << 24;
+        if let Some((mix, ukey)) = pkey {
+            for (i, &id) in name_ids.iter().enumerate() {
+                if id & GEN_TAG != 0 {
+                    continue;
+                }
+                let n = mix.decode(id, ukey);
+                if n >= (1 << 39) {
+                    continue;
+                }
+                let (pp, alias) = (n >> 9, n & 511);
+                if pp >= pcap || alias >= 8 {
+                    continue;
+                }
+                let pp = pp as usize;
+                if pinfo.len() <= pp {
+                    pinfo.resize(pp + 1, PInfo { comp: 0, mask: 0, amb: false });
+                }
+                let c = LINK_TAG | name[i];
+                let e = &mut pinfo[pp];
+                if e.mask == 0 {
+                    e.comp = c;
+                } else if e.comp != c {
+                    e.amb = true;
+                }
+                e.mask |= 1 << alias;
+            }
+        }
+        Links { tab, shard_shift, shard_bits, name, pinfo, pcap, pkey }
+    }
+
+    /// Same answer as `comp`, through the per-person table when it can answer exactly.
+    #[inline(always)]
+    fn comp_fast(&self, uid: u64) -> u64 {
+        if let Some((mix, ukey)) = self.pkey {
+            if uid & GEN_TAG == 0 {
+                let n = mix.decode(uid, ukey);
+                if n < (1 << 39) && (n & 511) < 8 && (n >> 9) < self.pcap {
+                    let pp = (n >> 9) as usize;
+                    let bit = 1u8 << (n & 511);
+                    match self.pinfo.get(pp) {
+                        None => return uid,
+                        Some(e) => {
+                            if e.mask & bit == 0 {
+                                return uid;
+                            }
+                            if !e.amb {
+                                return e.comp;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        self.comp(uid)
     }
 
     /// The person of a user ID: LINK_TAG | root for a linked ID, the ID itself otherwise.
@@ -1310,7 +1379,7 @@ impl CompCache {
         if self.k[h] == uid {
             return self.v[h];
         }
-        let c = links.comp(uid);
+        let c = links.comp_fast(uid);
         self.k[h] = uid;
         self.v[h] = c;
         c
@@ -1732,7 +1801,7 @@ fn run(
             }
             let pairs = std::mem::take(&mut *link_pairs.lock().unwrap());
             let tb = Instant::now();
-            let l = Links::build(pairs);
+            let l = Links::build(pairs, if ctxr.pos { Some((ctxr.mix, ctxr.ukey)) } else { None });
             if timing {
                 eprintln!("   union-find {:.1} ms", tb.elapsed().as_secs_f64() * 1e3);
             }
