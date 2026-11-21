@@ -156,6 +156,8 @@ struct Ctx {
     shift: usize,
     nparts: usize,
     scatter: bool,
+    mail: bool,
+    owner_mul: u64,
     tok_pdep: bool,
     part_cap: usize,
     exp: u32,
@@ -593,6 +595,19 @@ impl Scatter {
     }
 }
 
+/// Each thread owns a slot range of the event table. Records travel to their
+/// owner in batches and only the owner stores them: plain stores, no races.
+struct Mail {
+    inbox: Vec<Mutex<Vec<Vec<Rec>>>>,
+    published: AtomicUsize,
+    owner_mul: u64, // owner = min(nt - 1, (slot * owner_mul) >> 32)
+}
+
+#[inline(always)]
+fn owner_of(slot: usize, mul: u64, nt: usize) -> usize {
+    (((slot as u64) * mul) >> 32).min(nt as u64 - 1) as usize
+}
+
 struct ParseOut {
     links: Vec<(u64, u64)>,
     gev: Vec<Vec<GenEvent>>, // by hash % T
@@ -600,6 +615,8 @@ struct ParseOut {
     arena: Vec<u8>,
     stage: Vec<Rec>,
     stage_n: Vec<u8>,
+    outbox: Vec<Vec<Rec>>, // per owner
+    pool: Vec<Vec<Rec>>,
     ring: [(usize, u64, u64); RING],
     ring_n: usize,
     cring: [(usize, u64, u64); RING],
@@ -623,7 +640,45 @@ fn fnv(s: &[u8]) -> u64 {
 const RING: usize = 16;
 const PREFETCHW: bool = true;
 
+/// Stores records into the owner's range: the copy with the smallest ingest wins.
+fn place(ev: &Dense, recs: &[Rec]) {
+    for (k, r) in recs.iter().enumerate() {
+        if let Some(nx) = recs.get(k + 16) {
+            unsafe {
+                let p = ev.ptr.add(2 * nx.local as usize) as *const u8;
+                std::arch::asm!("prefetchw [{0}]", in(reg) p, options(nostack, preserves_flags, readonly));
+            }
+        }
+        let i = r.local as usize;
+        let (w0s, w1) = (r.w0s, r.w1);
+        if w0s > ev.w0(i).load(Relaxed) {
+            ev.w0(i).store(w0s, Relaxed);
+            ev.w1(i).store(w1, Relaxed);
+        }
+    }
+}
+
 impl ParseOut {
+    /// Hands the outgoing batches to their owners.
+    fn publish(&mut self, mail: &Mail) {
+        for o in 0..self.outbox.len() {
+            if self.outbox[o].is_empty() {
+                continue;
+            }
+            let fresh = self.pool.pop().unwrap_or_else(|| Vec::with_capacity(4096));
+            let full = std::mem::replace(&mut self.outbox[o], fresh);
+            mail.inbox[o].lock().unwrap().push(full);
+        }
+    }
+    /// Stores every batch sent to thread `me` so far.
+    fn drain(&mut self, mail: &Mail, me: usize, ev: &Dense) {
+        let got = std::mem::take(&mut *mail.inbox[me].lock().unwrap());
+        for mut b in got {
+            place(ev, &b);
+            b.clear();
+            self.pool.push(b);
+        }
+    }
     #[inline(always)]
     fn stage(&mut self, sc: &Scatter, shift: usize, slot: usize, w0s: u64, w1: u64) {
         let part = slot >> shift;
@@ -800,7 +855,9 @@ fn parse_event(f: &[&[u8]; 7], ctx: &Ctx, ev: &Dense, sc: &Scatter, out: &mut Pa
                     std::hint::black_box(w0 ^ w1);
                     return;
                 }
-                if ctx.scatter {
+                if ctx.mail {
+                    out.outbox[owner_of(slot, ctx.owner_mul, nt)].push(Rec { w0s: !w0, w1, local: slot as u32 });
+                } else if ctx.scatter {
                     out.stage(sc, ctx.shift, slot, !w0, w1);
                 } else {
                     out.put(ev, slot, !w0, w1);
@@ -1458,6 +1515,8 @@ fn main() {
         shift: 15,
         nparts: 0,
         scatter: false,
+        mail: false,
+        owner_mul: 0,
         tok_pdep: std::env::var("SS_TOK").map(|v| v == "pdep").unwrap_or(false),
         part_cap: 0,
         exp: std::env::var("SS_EXP").ok().and_then(|v| v.parse().ok()).unwrap_or(0),
@@ -1518,6 +1577,13 @@ fn run(
     } else {
         ctx.nparts = 1;
     }
+    ctx.mail = ctx.pos && !ctx.scatter && std::env::var("SS_MAIL").is_ok();
+    if ctx.mail {
+        // equal slot ranges over the expected numbers (cap_e is twice the estimate)
+        let span = (ctx.cap_e / 2).max(1) as f64 * 1.02;
+        ctx.owner_mul = ((nt as f64) * (1u64 << 32) as f64 / span) as u64;
+    }
+    let mail = Mail { inbox: (0..nt).map(|_| Mutex::new(Vec::new())).collect(), published: AtomicUsize::new(0), owner_mul: ctx.owner_mul };
     let sc = Scatter::new(if ctx.scatter { ctx.nparts } else { 1 }, if ctx.scatter { ctx.part_cap } else { 1 });
     let ev = Dense::new(if ctx.pos { ctx.cap_e as usize } else { 1 });
     let cl = Dense::new(if ctx.pos { ctx.cap_c as usize } else { 1 });
@@ -1543,13 +1609,18 @@ fn run(
 
     let (outs, links): (Vec<ParseOut>, Links) = std::thread::scope(|s| {
         let mut hs = Vec::new();
-        for _ in 0..nt {
-            hs.push(s.spawn(|| {
+        for me in 0..nt {
+            let mail = &mail;
+            let (ev, cl, sc) = (&ev, &cl, &sc);
+            let (next, chunks, link_pairs, links_done, remaining, lfd, efd, cfd) = (&next, &chunks, &link_pairs, &links_done, &remaining, &lfd, &efd, &cfd);
+            hs.push(s.spawn(move || {
                 let mut out = ParseOut {
                     links: Vec::new(),
                     gev: (0..nt).map(|_| Vec::new()).collect(),
                     gcl: (0..nt).map(|_| Vec::new()).collect(),
                     arena: Vec::new(),
+                    outbox: (0..nt).map(|_| Vec::with_capacity(4096)).collect(),
+                    pool: Vec::new(),
                     stage: if ctxr.scatter { vec![Rec { w0s: 0, w1: 0, local: 0 }; ctxr.nparts * STAGE] } else { Vec::new() },
                     stage_n: if ctxr.scatter { vec![0u8; ctxr.nparts] } else { Vec::new() },
                     ring: [(0, 0, 0); RING],
@@ -1620,6 +1691,10 @@ fn run(
                             scan::lines::<4>(d, a, b, |f| parse_click(f, ctxr, &cl, &mut out, nt));
                         }
                     }
+                    if ctxr.mail && kind == 1 {
+                        out.publish(mail);
+                        out.drain(mail, me, ev);
+                    }
                     // the last worker done with a file unmaps it, so exit has less to tear down
                     if remaining[kind as usize][fi].fetch_sub(1, Relaxed) == 1 && use_mmap {
                         let m = fset[fi].1;
@@ -1629,6 +1704,16 @@ fn run(
                     }
                 }
                 out.flush(&ev);
+                if ctxr.mail {
+                    // last batches out, wait for every thread to do the same, then store what is ours
+                    out.publish(mail);
+                    mail.published.fetch_add(1, Relaxed);
+                    while mail.published.load(Relaxed) < nt {
+                        out.drain(mail, me, ev);
+                        std::thread::yield_now();
+                    }
+                    out.drain(mail, me, ev);
+                }
                 if ctxr.scatter {
                     out.stage_flush(&sc);
                 }
@@ -1967,7 +2052,9 @@ fn run(
                                         }
                                     }
                                     let row0 = out.users.len() as u32;
-                                    process_person(ctx, r.comp, &evbuf, &clbuf, &mut out);
+                                    if ctx.exp != 5 {
+                                        process_person(ctx, r.comp, &evbuf, &clbuf, &mut out);
+                                    }
                                     procs.push(Proc { comp: r.comp, a: r.a, b: r.b, found: found as u32, rows: (row0, out.users.len() as u32) });
                                 }
                             }
