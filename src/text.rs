@@ -273,8 +273,8 @@ pub fn canon10(s: &[u8], prefix: &[u8]) -> Option<u32> {
 
 /// The ID mix and its inverse.
 pub const MASK40: u64 = (1 << 40) - 1;
-const M1: u64 = 0x9E37_79B9_7F4B;
-const M2: u64 = 0xD6E8_FEB8_6659;
+pub const M1: u64 = 173_961_102_589_771;
+const M2: u64 = 236_296_194_254_425;
 
 fn inv40(m: u64) -> u64 {
     let mut x: u64 = m; // Newton: x = x*(2 - m*x)

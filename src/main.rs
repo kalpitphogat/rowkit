@@ -1147,7 +1147,7 @@ fn find_keys(mix: &Mix, ev_rows: &[Vec<Vec<u8>>], cl_rows: &[Vec<Vec<u8>>], est_
         let bound = ((est as f64) * share) as u64 + 1000;
         let x1 = mix.unmix(first[0]);
         for g in 0..bound {
-            let k = (x1 ^ g.wrapping_mul(0x9E37_79B9_7F4B)) & MASK40;
+            let k = (x1 ^ g.wrapping_mul(M1)) & MASK40;
             if first[1..first.len().min(5)].iter().all(|&m| mix.decode(m, k) < bound) {
                 let good = all.iter().filter(|&&m| mix.decode(m, k) < est * 3 / 2 + 1000).count();
                 if good * 100 >= all.len() * 97 {
