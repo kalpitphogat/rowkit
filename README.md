@@ -1,0 +1,3 @@
+# rowkit
+
+Small batch utility.
