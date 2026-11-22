@@ -2305,19 +2305,24 @@ fn run(
                     for (k, &(tt, ii)) in gev_kept[t].iter().enumerate() {
                         let g = &outs[tt as usize].gev[t][ii as usize];
                         let comp = cache.get(links, g.uid);
-                        bits.force(comp, EV_HAVE | EV_MULTI);
-                        if let Some(pp) = links.local_person(g.uid) {
-                            pbits.force(pp as u64, EV_HAVE | EV_MULTI);
+                        if ctx.pos {
+                            // occupancy bits are read only by the dense-table passes
+                            bits.force(comp, EV_HAVE | EV_MULTI);
+                            if let Some(pp) = links.local_person(g.uid) {
+                                pbits.force(pp as u64, EV_HAVE | EV_MULTI);
+                            }
                         }
                         b[bucket_of(comp)].push(Entry { comp, kind: 2, sorted: true, t: t as u16, a: k as u32, b: 0 });
                     }
                     for (k, &(tt, ii)) in gcl_kept[t].iter().enumerate() {
                         let g = &outs[tt as usize].gcl[t][ii as usize];
                         let comp = cache.get(links, g.uid);
-                        bits.force(comp, CL_HAVE | CL_MULTI);
-                        if let Some(pp) = links.local_person(g.uid) {
-                            // counted but never in the run list: such a person is never taken as simple
-                            clcnt[pp].fetch_add(1, Relaxed);
+                        if ctx.pos {
+                            bits.force(comp, CL_HAVE | CL_MULTI);
+                            if let Some(pp) = links.local_person(g.uid) {
+                                // counted but never in the run list: such a person is never taken as simple
+                                clcnt[pp].fetch_add(1, Relaxed);
+                            }
                         }
                         b[bucket_of(comp)].push(Entry { comp, kind: 3, sorted: true, t: t as u16, a: k as u32, b: 0 });
                     }
@@ -2652,7 +2657,8 @@ fn run(
                         for e in entries.iter() {
                             list.extend_from_slice(&e[bi]);
                         }
-                        list.sort_unstable_by(|x, y| x.comp.cmp(&y.comp).then(x.kind.cmp(&y.kind)).then(x.a.cmp(&y.a)));
+                        // only grouping by person matters: events and clicks are ordered per person below
+                        list.sort_unstable_by_key(|x| x.comp);
                         let mut g = 0;
                         while g < list.len() {
                             let comp = list[g].comp;
