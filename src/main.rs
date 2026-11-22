@@ -365,6 +365,43 @@ fn sort_refs(v: &mut Vec<(u16, u32)>) {
     }
 }
 
+/// Stable radix sort of entries on a 16-bit key, two 8-bit passes (counters stay in L1).
+fn radix16(v: &mut Vec<Entry>, tmp: &mut Vec<Entry>, key: impl Fn(&Entry) -> usize) {
+    let n = v.len();
+    if n < 64 {
+        v.sort_by_key(|x| key(x));
+        return;
+    }
+    tmp.clear();
+    tmp.reserve(n);
+    unsafe { tmp.set_len(n) };
+    let mut c0 = [0usize; 256];
+    let mut c1 = [0usize; 256];
+    for x in v.iter() {
+        let k = key(x);
+        c0[k & 255] += 1;
+        c1[k >> 8] += 1;
+    }
+    let (mut s0, mut s1) = (0, 0);
+    for i in 0..256 {
+        let (a, b) = (c0[i], c1[i]);
+        c0[i] = s0;
+        c1[i] = s1;
+        s0 += a;
+        s1 += b;
+    }
+    for x in v.iter() {
+        let d = key(x) & 255;
+        tmp[c0[d]] = *x;
+        c0[d] += 1;
+    }
+    for x in tmp.iter() {
+        let d = key(x) >> 8;
+        v[c1[d]] = *x;
+        c1[d] += 1;
+    }
+}
+
 /// Stable LSD radix sort on the low `bits` bits of `key`, 16 bits per pass.
 fn radix_sort<T: Copy>(v: &mut Vec<T>, key: impl Fn(&T) -> u64, bits: u32) {
     let n = v.len();
@@ -2778,6 +2815,7 @@ fn run(
                 s.spawn(move || {
                 pin_self();
                     let mut list: Vec<Entry> = Vec::new();
+                    let mut rtmp: Vec<Entry> = Vec::new();
                     let mut evbuf: Vec<Ev> = Vec::new();
                     let mut clbuf: Vec<Cl> = Vec::new();
                     loop {
@@ -2789,8 +2827,25 @@ fn run(
                         for e in entries.iter() {
                             list.extend_from_slice(&e[bi]);
                         }
-                        // only grouping by person matters: events and clicks are ordered per person below
-                        list.sort_unstable_by_key(|x| x.comp);
+                        // only grouping by person matters: events and clicks are ordered per person below.
+                        // Two 8-bit radix passes on 16 bits of a person hash (cache-sized counters), then
+                        // runs that share those bits are put in exact person order.
+                        let h16 = |c: u64| -> usize { ((c.wrapping_mul(0xD6E8_FEB8_6659_FD93) >> 40) & 0xFFFF) as usize };
+                        radix16(&mut list, &mut rtmp, |x| h16(x.comp));
+                        let mut r0 = 0;
+                        while r0 < list.len() {
+                            let hv = h16(list[r0].comp);
+                            let mut r1 = r0 + 1;
+                            let mut mixed = false;
+                            while r1 < list.len() && h16(list[r1].comp) == hv {
+                                mixed |= list[r1].comp != list[r0].comp;
+                                r1 += 1;
+                            }
+                            if mixed {
+                                list[r0..r1].sort_unstable_by_key(|x| x.comp);
+                            }
+                            r0 = r1;
+                        }
                         let mut g = 0;
                         while g < list.len() {
                             let comp = list[g].comp;
