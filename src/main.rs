@@ -203,18 +203,85 @@ struct Interner {
     strs: Vec<Vec<u8>>,
 }
 
-static INTERN: Mutex<Option<Interner>> = Mutex::new(None);
+// Interned (non-canonical) IDs live in 64 independently locked shards, so threads
+// rarely wait on each other. Index = shard << 24 | position in the shard.
+const ISH: usize = 64;
+#[allow(clippy::declare_interior_mutable_const)]
+const ISH_INIT: Mutex<Option<Interner>> = Mutex::new(None);
+static INTERN: [Mutex<Option<Interner>>; ISH] = [ISH_INIT; ISH];
+
+#[inline]
+fn bytes_hash(s: &[u8]) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325 ^ s.len() as u64;
+    let mut i = 0;
+    while i + 8 <= s.len() {
+        let v = u64::from_le_bytes(s[i..i + 8].try_into().unwrap());
+        h = (h ^ v).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        h ^= h >> 29;
+        i += 8;
+    }
+    let mut t = 0u64;
+    for (k, &b) in s[i..].iter().enumerate() {
+        t |= (b as u64) << (8 * k);
+    }
+    h = (h ^ t).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    h ^ (h >> 31)
+}
+
+// Per-thread cache in front of the shards: (hash, enc, len, bytes), checked byte for byte.
+const ICACHE: usize = 4096;
+thread_local! {
+    static ICACHE_T: std::cell::RefCell<Vec<(u64, u64, u8, [u8; 47])>> = std::cell::RefCell::new(Vec::new());
+}
 
 fn intern(s: &[u8]) -> u64 {
-    let mut g = INTERN.lock().unwrap();
-    let it = g.get_or_insert_with(|| Interner { map: HashMap::new(), strs: Vec::new() });
-    if let Some(&i) = it.map.get(s) {
-        return GEN_TAG | i as u64;
+    let h = bytes_hash(s);
+    let small = s.len() <= 47;
+    if small {
+        let hit = ICACHE_T.with(|c| {
+            let c = c.borrow();
+            if c.is_empty() {
+                return None;
+            }
+            let e = &c[(h as usize) & (ICACHE - 1)];
+            if e.0 == h && e.2 as usize == s.len() && &e.3[..s.len()] == s && e.1 != 0 {
+                Some(e.1)
+            } else {
+                None
+            }
+        });
+        if let Some(v) = hit {
+            return v;
+        }
     }
-    let i = it.strs.len() as u32;
-    it.strs.push(s.to_vec());
-    it.map.insert(s.to_vec(), i);
-    GEN_TAG | i as u64
+    let sh = (h >> 58) as usize;
+    let enc = {
+        let mut g = INTERN[sh].lock().unwrap();
+        let it = g.get_or_insert_with(|| Interner { map: HashMap::new(), strs: Vec::new() });
+        if let Some(&i) = it.map.get(s) {
+            GEN_TAG | ((sh as u64) << 24) | i as u64
+        } else {
+            let i = it.strs.len() as u32;
+            assert!(i < (1 << 24), "interner shard full");
+            it.strs.push(s.to_vec());
+            it.map.insert(s.to_vec(), i);
+            GEN_TAG | ((sh as u64) << 24) | i as u64
+        }
+    };
+    if small {
+        ICACHE_T.with(|c| {
+            let mut c = c.borrow_mut();
+            if c.is_empty() {
+                c.resize(ICACHE, (0, 0, 0, [0u8; 47]));
+            }
+            let e = &mut c[(h as usize) & (ICACHE - 1)];
+            e.0 = h;
+            e.1 = enc;
+            e.2 = s.len() as u8;
+            e.3[..s.len()].copy_from_slice(s);
+        });
+    }
+    enc
 }
 
 #[inline(always)]
@@ -228,8 +295,9 @@ fn uid_enc(s: &[u8]) -> u64 {
 fn uid_bytes(enc: u64, out: &mut Vec<u8>) {
     out.clear();
     if enc & GEN_TAG != 0 {
-        let g = INTERN.lock().unwrap();
-        out.extend_from_slice(&g.as_ref().unwrap().strs[(enc & 0xFFFF_FFFF) as usize]);
+        let sh = ((enc >> 24) & (ISH as u64 - 1)) as usize;
+        let g = INTERN[sh].lock().unwrap();
+        out.extend_from_slice(&g.as_ref().unwrap().strs[(enc & 0xFF_FFFF) as usize]);
     } else {
         base36_string(b'u', enc, out);
     }
@@ -269,6 +337,50 @@ fn canon_key(mut v: u64) -> u64 {
     u64::from_be_bytes(buf)
 }
 
+
+
+/// Sorts (thread, index) references into memory order.
+fn sort_refs(v: &mut Vec<(u16, u32)>) {
+    if v.iter().all(|r| r.1 < (1 << 24) && r.0 < 256) {
+        radix_sort(v, |r| ((r.0 as u64) << 24) | r.1 as u64, 32);
+    } else {
+        radix_sort(v, |r| ((r.0 as u64) << 32) | r.1 as u64, 48);
+    }
+}
+
+/// Stable LSD radix sort on the low `bits` bits of `key`, 16 bits per pass.
+fn radix_sort<T: Copy>(v: &mut Vec<T>, key: impl Fn(&T) -> u64, bits: u32) {
+    let n = v.len();
+    if n < 256 {
+        v.sort_by_key(|x| key(x) & if bits >= 64 { u64::MAX } else { (1u64 << bits) - 1 });
+        return;
+    }
+    let mut tmp: Vec<T> = Vec::with_capacity(n);
+    unsafe { tmp.set_len(n) };
+    let mut cnt = vec![0usize; 1 << 16];
+    let mut shift = 0;
+    while shift < bits {
+        for c in cnt.iter_mut() {
+            *c = 0;
+        }
+        for x in v.iter() {
+            cnt[((key(x) >> shift) & 0xFFFF) as usize] += 1;
+        }
+        let mut sum = 0;
+        for c in cnt.iter_mut() {
+            let t = *c;
+            *c = sum;
+            sum += t;
+        }
+        for x in v.iter() {
+            let d = ((key(x) >> shift) & 0xFFFF) as usize;
+            tmp[cnt[d]] = *x;
+            cnt[d] += 1;
+        }
+        std::mem::swap(v, &mut tmp);
+        shift += 16;
+    }
+}
 
 // ---------------------------------------------------------------- cpu pinning
 
@@ -2011,45 +2123,68 @@ fn run(
                 let arenas = &arenas;
                 s.spawn(move || {
                 pin_self();
-                    // events: sort by (hash, ingest); the first copy of each ID is the one kept
-                    let mut refs: Vec<(u64, i64, u16, u32)> = Vec::new();
+                    // events: group by hash (radix sort); per distinct ID the copy with the
+                    // smallest ingest is kept, then dropped if invalid
+                    let mut refs: Vec<(u64, i64, u16, u32, bool)> = Vec::with_capacity(outs.iter().map(|o| o.gev[p].len()).sum());
                     for (t, o) in outs.iter().enumerate() {
                         for (i, g) in o.gev[p].iter().enumerate() {
-                            refs.push((g.hash, g.ingest, t as u16, i as u32));
+                            refs.push((g.hash, g.ingest, t as u16, i as u32, g.valid));
                         }
                     }
-                    refs.sort_unstable_by_key(|r| (r.0, r.1));
+                    radix_sort(&mut refs, |r| r.0 >> 32, 32);
                     let key_e = |t: u16, i: u32| -> &[u8] {
                         let g = &outs[t as usize].gev[p][i as usize];
                         &arenas[t as usize][g.eid_off as usize..(g.eid_off + g.eid_len) as usize]
                     };
                     let mut evs: Vec<(u16, u32)> = Vec::new();
+                    let mut taken: Vec<bool> = Vec::new();
                     let mut g0 = 0;
                     while g0 < refs.len() {
-                        let mut g1 = g0;
-                        while g1 < refs.len() && refs[g1].0 == refs[g0].0 {
+                        let mut g1 = g0 + 1;
+                        while g1 < refs.len() && refs[g1].0 >> 32 == refs[g0].0 >> 32 {
                             g1 += 1;
                         }
-                        for j in g0..g1 {
-                            let kj = key_e(refs[j].2, refs[j].3);
-                            if (g0..j).any(|k| key_e(refs[k].2, refs[k].3) == kj) {
-                                continue;
+                        if g1 == g0 + 1 {
+                            let r = refs[g0];
+                            if r.4 {
+                                evs.push((r.2, r.3));
                             }
-                            if outs[refs[j].2 as usize].gev[p][refs[j].3 as usize].valid {
-                                evs.push((refs[j].2, refs[j].3));
+                        } else {
+                            taken.clear();
+                            taken.resize(g1 - g0, false);
+                            for j in g0..g1 {
+                                if taken[j - g0] {
+                                    continue;
+                                }
+                                let kj = key_e(refs[j].2, refs[j].3);
+                                let hj = refs[j].0;
+                                let mut best = j;
+                                for k in j..g1 {
+                                    if !taken[k - g0] && refs[k].0 == hj && key_e(refs[k].2, refs[k].3) == kj {
+                                        taken[k - g0] = true;
+                                        if refs[k].1 < refs[best].1 {
+                                            best = k;
+                                        }
+                                    }
+                                }
+                                if refs[best].4 {
+                                    evs.push((refs[best].2, refs[best].3));
+                                }
                             }
                         }
                         g0 = g1;
                     }
                     drop(refs);
-                    // clicks: copies are identical, keep the first of each ID
-                    let mut refs: Vec<(u64, u16, u32)> = Vec::new();
+                    // kept rows back in memory order, so later passes read them sequentially
+                    sort_refs(&mut evs);
+                    // clicks: copies are identical, keep one of each ID
+                    let mut refs: Vec<(u64, u16, u32)> = Vec::with_capacity(outs.iter().map(|o| o.gcl[p].len()).sum());
                     for (t, o) in outs.iter().enumerate() {
                         for (i, g) in o.gcl[p].iter().enumerate() {
                             refs.push((g.hash, t as u16, i as u32));
                         }
                     }
-                    refs.sort_unstable_by_key(|r| r.0);
+                    radix_sort(&mut refs, |r| r.0 >> 32, 32);
                     let key_c = |t: u16, i: u32| -> &[u8] {
                         let g = &outs[t as usize].gcl[p][i as usize];
                         &arenas[t as usize][g.cid_off as usize..(g.cid_off + g.cid_len) as usize]
@@ -2057,19 +2192,21 @@ fn run(
                     let mut cls: Vec<(u16, u32)> = Vec::new();
                     let mut g0 = 0;
                     while g0 < refs.len() {
-                        let mut g1 = g0;
-                        while g1 < refs.len() && refs[g1].0 == refs[g0].0 {
+                        let mut g1 = g0 + 1;
+                        while g1 < refs.len() && refs[g1].0 >> 32 == refs[g0].0 >> 32 {
                             g1 += 1;
                         }
                         for j in g0..g1 {
                             let kj = key_c(refs[j].1, refs[j].2);
-                            if (g0..j).any(|k| key_c(refs[k].1, refs[k].2) == kj) {
+                            if (g0..j).any(|k| refs[k].0 == refs[j].0 && key_c(refs[k].1, refs[k].2) == kj) {
                                 continue;
                             }
                             cls.push((refs[j].1, refs[j].2));
                         }
                         g0 = g1;
                     }
+                    drop(refs);
+                    sort_refs(&mut cls);
                     (evs, cls)
                 })
             })
