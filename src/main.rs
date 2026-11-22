@@ -734,6 +734,18 @@ impl Links {
         }
     }
 
+    /// Prefetches the table slot `comp(uid)` will read first.
+    #[inline(always)]
+    fn prefetch(&self, uid: u64) {
+        let hh = hash64(uid);
+        let sh = if self.shard_shift >= 64 { 0 } else { (hh >> self.shard_shift) as usize };
+        let lmask = (1usize << self.shard_bits) - 1;
+        let i = (sh << self.shard_bits) + (hh as usize & lmask);
+        if i < self.tab.len() {
+            unsafe { std::arch::x86_64::_mm_prefetch::<{ std::arch::x86_64::_MM_HINT_T0 }>(self.tab.as_ptr().add(i) as *const i8) };
+        }
+    }
+
     /// The person of a user ID: LINK_TAG | root for a linked ID, the ID itself otherwise.
     #[inline(always)]
     fn comp(&self, uid: u64) -> u64 {
@@ -2278,7 +2290,8 @@ fn run(
                 let (cl, links, gev_kept, gcl_kept, bits, outs, pbits, clcnt) = (&cl, &links, &gev_kept, &gcl_kept, &bits, &outs, &pbits, &clcnt);
                 s.spawn(move || {
                 pin_self();
-                    let mut b: Vec<Vec<Entry>> = (0..NB).map(|_| Vec::new()).collect();
+                    let per = (gev_kept[t].len() + gcl_kept[t].len()) / NB;
+                    let mut b: Vec<Vec<Entry>> = (0..NB).map(|_| Vec::with_capacity(per + per / 4 + 16)).collect();
                     let mut cr: Vec<Run> = Vec::new();
                     let mut cache = CompCache::new();
                     if ctx.pos {
@@ -2316,7 +2329,13 @@ fn run(
                             cr.push(cur);
                         }
                     }
-                    for (k, &(tt, ii)) in gev_kept[t].iter().enumerate() {
+                    const AHEAD: usize = 8;
+                    let gk = &gev_kept[t];
+                    for (k, &(tt, ii)) in gk.iter().enumerate() {
+                        if !ctx.pos && k + AHEAD < gk.len() {
+                            let (t2, i2) = gk[k + AHEAD];
+                            links.prefetch(outs[t2 as usize].gev[t][i2 as usize].uid);
+                        }
                         let g = &outs[tt as usize].gev[t][ii as usize];
                         let comp = cache.get(links, g.uid);
                         if ctx.pos {
@@ -2330,7 +2349,12 @@ fn run(
                         let _ = k;
                         b[bucket_of(comp)].push(Entry { comp, kind: 2, sorted: g.purchase, t: g.cat, a: g.ts as u64 as u32, b: (g.ts as u64 >> 32) as u32, c: g.price });
                     }
-                    for (k, &(tt, ii)) in gcl_kept[t].iter().enumerate() {
+                    let ck = &gcl_kept[t];
+                    for (k, &(tt, ii)) in ck.iter().enumerate() {
+                        if !ctx.pos && k + AHEAD < ck.len() {
+                            let (t2, i2) = ck[k + AHEAD];
+                            links.prefetch(outs[t2 as usize].gcl[t][i2 as usize].uid);
+                        }
                         let g = &outs[tt as usize].gcl[t][ii as usize];
                         let comp = cache.get(links, g.uid);
                         if ctx.pos {
