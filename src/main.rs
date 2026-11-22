@@ -162,6 +162,8 @@ struct Ctx {
     tok_pdep: bool,
     part_cap: usize,
     exp: u32,
+    ge_cap: u64,
+    gc_cap: u64,
 }
 
 impl Ctx {
@@ -1872,6 +1874,9 @@ fn main() {
         ckey,
         ukey,
         cap_e: if pos { est_e * 2 + 4096 } else { 0 },
+        // reservations for the generic lists: the estimate plus 10%, capped against bad estimates
+        ge_cap: (est_e + est_e / 10 + 1024).min(400_000_000),
+        gc_cap: (est_c + est_c / 10 + 1024).min(200_000_000),
         cap_c: if pos { est_c * 2 + 4096 } else { 0 },
         ingest_base_s: ws / 1000 - 15 * 86_400,
         shift: 15,
@@ -1989,9 +1994,10 @@ fn run(
                 pin_self();
                 let mut out = ParseOut {
                     links: Vec::new(),
-                    gev: (0..nt).map(|_| Vec::new()).collect(),
-                    gcl: (0..nt).map(|_| Vec::new()).collect(),
-                    arena: Vec::new(),
+                    // generic mode: room for this thread's share up front (no regrowth copies)
+                    gev: (0..nt).map(|_| Vec::with_capacity(if ctxr.pos { 0 } else { (ctxr.ge_cap as usize) / (nt * nt) })).collect(),
+                    gcl: (0..nt).map(|_| Vec::with_capacity(if ctxr.pos { 0 } else { (ctxr.gc_cap as usize) / (nt * nt) })).collect(),
+                    arena: Vec::with_capacity(if ctxr.pos { 0 } else { ((ctxr.ge_cap + ctxr.gc_cap) as usize / nt) * 14 }),
                     outbox: (0..nt).map(|_| Vec::with_capacity(4096)).collect(),
                     pool: Vec::new(),
                     stage: if ctxr.scatter { vec![Rec { w0s: 0, w1: 0, local: 0 }; ctxr.nparts * STAGE] } else { Vec::new() },
