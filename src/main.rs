@@ -2151,8 +2151,82 @@ fn run(
                 pin_self();
                     // events: group by hash (radix sort); per distinct ID the copy with the
                     // smallest ingest is kept, then dropped if invalid
-                    let mut refs: Vec<(u64, i64, u16, u32, bool)> = Vec::with_capacity(outs.iter().map(|o| o.gev[p].len()).sum());
-                    for (t, o) in outs.iter().enumerate() {
+                    // Compact form first: 16-byte records (hash, ingest rel 32 | valid 1 | thread 4 | index 27).
+                    // Anything that does not fit (ingest far outside the window, huge lists) takes the exact
+                    // 24-byte form below; both keep, per distinct ID, the copy with the smallest ingest.
+                    let ibase = ctx.ws - 15 * DAY;
+                    let fits = outs.len() <= 16 && outs.iter().all(|o| o.gev[p].len() < (1 << 27));
+                    let mut compact: Option<Vec<(u16, u32)>> = None;
+                    if fits {
+                        let mut r16: Vec<(u64, u64)> = Vec::with_capacity(outs.iter().map(|o| o.gev[p].len()).sum());
+                        let mut ok = true;
+                        'build: for (t, o) in outs.iter().enumerate() {
+                            for (i, g) in o.gev[p].iter().enumerate() {
+                                let rel: u64 = if g.ingest == i64::MAX {
+                                    0xFFFF_FFFF
+                                } else {
+                                    let d = g.ingest.wrapping_sub(ibase);
+                                    if g.ingest < ibase || d >= 0xFFFF_FFFF {
+                                        ok = false;
+                                        break 'build;
+                                    }
+                                    d as u64
+                                };
+                                r16.push((g.hash, (rel << 32) | ((g.valid as u64) << 31) | ((t as u64) << 27) | i as u64));
+                            }
+                        }
+                        if ok {
+                            radix_sort(&mut r16, |r| r.0 >> 32, 32);
+                            let key16 = |w: u64| -> &[u8] {
+                                let (t, i) = (((w >> 27) & 15) as usize, (w & ((1 << 27) - 1)) as usize);
+                                let g = &outs[t].gev[p][i];
+                                &arenas[t][g.eid_off as usize..(g.eid_off + g.eid_len) as usize]
+                            };
+                            let tid = |w: u64| -> (u16, u32) { (((w >> 27) & 15) as u16, (w & ((1 << 27) - 1)) as u32) };
+                            let mut evs: Vec<(u16, u32)> = Vec::new();
+                            let mut taken: Vec<bool> = Vec::new();
+                            let mut g0 = 0;
+                            while g0 < r16.len() {
+                                let mut g1 = g0 + 1;
+                                while g1 < r16.len() && r16[g1].0 >> 32 == r16[g0].0 >> 32 {
+                                    g1 += 1;
+                                }
+                                if g1 == g0 + 1 {
+                                    let w = r16[g0].1;
+                                    if (w >> 31) & 1 != 0 {
+                                        evs.push(tid(w));
+                                    }
+                                } else {
+                                    taken.clear();
+                                    taken.resize(g1 - g0, false);
+                                    for j in g0..g1 {
+                                        if taken[j - g0] {
+                                            continue;
+                                        }
+                                        let kj = key16(r16[j].1);
+                                        let hj = r16[j].0;
+                                        let mut best = j;
+                                        for k in j..g1 {
+                                            if !taken[k - g0] && r16[k].0 == hj && key16(r16[k].1) == kj {
+                                                taken[k - g0] = true;
+                                                if (r16[k].1 >> 32) < (r16[best].1 >> 32) {
+                                                    best = k;
+                                                }
+                                            }
+                                        }
+                                        let w = r16[best].1;
+                                        if (w >> 31) & 1 != 0 {
+                                            evs.push(tid(w));
+                                        }
+                                    }
+                                }
+                                g0 = g1;
+                            }
+                            compact = Some(evs);
+                        }
+                    }
+                    let mut refs: Vec<(u64, i64, u16, u32, bool)> = Vec::with_capacity(if compact.is_some() { 0 } else { outs.iter().map(|o| o.gev[p].len()).sum() });
+                    for (t, o) in outs.iter().enumerate().filter(|_| compact.is_none()) {
                         for (i, g) in o.gev[p].iter().enumerate() {
                             refs.push((g.hash, g.ingest, t as u16, i as u32, g.valid));
                         }
@@ -2201,6 +2275,9 @@ fn run(
                         g0 = g1;
                     }
                     drop(refs);
+                    if let Some(c) = compact {
+                        evs = c;
+                    }
                     // kept rows back in memory order, so later passes read them sequentially
                     sort_refs(&mut evs);
                     // clicks: copies are identical, keep one of each ID
