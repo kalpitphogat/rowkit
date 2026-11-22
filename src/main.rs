@@ -201,8 +201,23 @@ impl Ctx {
 // ---------------------------------------------------------------- user ids
 
 struct Interner {
-    map: HashMap<Vec<u8>, u32>,
+    map: HashMap<Vec<u8>, u32, std::hash::BuildHasherDefault<FastHash>>,
     strs: Vec<Vec<u8>>,
+}
+
+/// Hasher for interned byte strings: eight bytes per step instead of SipHash.
+#[derive(Default)]
+struct FastHash(u64);
+impl std::hash::Hasher for FastHash {
+    fn write(&mut self, b: &[u8]) {
+        self.0 = (self.0 ^ bytes_hash(b)).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    }
+    fn write_usize(&mut self, n: usize) {
+        self.0 = (self.0 ^ n as u64).wrapping_mul(0xC2B2_AE3D_27D4_EB4F);
+    }
+    fn finish(&self) -> u64 {
+        self.0 ^ (self.0 >> 29)
+    }
 }
 
 // Interned (non-canonical) IDs live in 64 independently locked shards, so threads
@@ -259,7 +274,7 @@ fn intern(s: &[u8]) -> u64 {
     let sh = (h >> 58) as usize;
     let enc = {
         let mut g = INTERN[sh].lock().unwrap();
-        let it = g.get_or_insert_with(|| Interner { map: HashMap::new(), strs: Vec::new() });
+        let it = g.get_or_insert_with(|| Interner { map: HashMap::default(), strs: Vec::new() });
         if let Some(&i) = it.map.get(s) {
             GEN_TAG | ((sh as u64) << 24) | i as u64
         } else {
