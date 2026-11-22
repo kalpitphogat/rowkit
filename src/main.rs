@@ -943,6 +943,13 @@ struct ParseOut {
     dc: DateCache,
 }
 
+/// Partition of a row hash (low 32 bits; the dedup sort uses the high 32).
+#[inline(always)]
+fn part_of(h: u64, nt: usize) -> usize {
+    (((h & 0xFFFF_FFFF) * nt as u64) >> 32) as usize
+}
+
+#[allow(dead_code)]
 fn fnv(s: &[u8]) -> u64 {
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
     for &c in s {
@@ -1185,10 +1192,10 @@ fn parse_event(f: &[&[u8]; 7], ctx: &Ctx, ev: &Dense, sc: &Scatter, out: &mut Pa
             }
         }
     }
-    let h = fnv(eid);
+    let h = bytes_hash(eid);
     let off = out.arena.len() as u32;
     out.arena.extend_from_slice(eid);
-    out.gev[(h % nt as u64) as usize].push(GenEvent {
+    out.gev[part_of(h, nt)].push(GenEvent {
         eid_off: off,
         eid_len: eid.len() as u32,
         hash: h,
@@ -1232,10 +1239,10 @@ fn parse_click(f: &[&[u8]; 4], ctx: &Ctx, cl: &Dense, out: &mut ParseOut, nt: us
             }
         }
     }
-    let h = fnv(cid);
+    let h = bytes_hash(cid);
     let off = out.arena.len() as u32;
     out.arena.extend_from_slice(cid);
-    out.gcl[(h % nt as u64) as usize].push(GenClick { cid_off: off, cid_len: cid.len() as u32, hash: h, ts, uid, camp });
+    out.gcl[part_of(h, nt)].push(GenClick { cid_off: off, cid_len: cid.len() as u32, hash: h, ts, uid, camp });
 }
 
 // ---------------------------------------------------------------- key discovery
@@ -1706,6 +1713,7 @@ struct Entry {
     t: u16,
     a: u32,
     b: u32,
+    c: u32, // kind 2: price (with a, b = ts, t = cat, sorted = purchase)
 }
 
 #[inline(always)]
@@ -2312,7 +2320,9 @@ fn run(
                                 pbits.force(pp as u64, EV_HAVE | EV_MULTI);
                             }
                         }
-                        b[bucket_of(comp)].push(Entry { comp, kind: 2, sorted: true, t: t as u16, a: k as u32, b: 0 });
+                        // the event itself rides in the entry: ts in a/b, cat in t, purchase in sorted, price in c
+                        let _ = k;
+                        b[bucket_of(comp)].push(Entry { comp, kind: 2, sorted: g.purchase, t: g.cat, a: g.ts as u64 as u32, b: (g.ts as u64 >> 32) as u32, c: g.price });
                     }
                     for (k, &(tt, ii)) in gcl_kept[t].iter().enumerate() {
                         let g = &outs[tt as usize].gcl[t][ii as usize];
@@ -2324,7 +2334,7 @@ fn run(
                                 clcnt[pp].fetch_add(1, Relaxed);
                             }
                         }
-                        b[bucket_of(comp)].push(Entry { comp, kind: 3, sorted: true, t: t as u16, a: k as u32, b: 0 });
+                        b[bucket_of(comp)].push(Entry { comp, kind: 3, sorted: true, t: t as u16, a: k as u32, b: 0, c: 0 });
                     }
                     (cr, b)
                 })
@@ -2510,7 +2520,7 @@ fn run(
                                     }
                                 }
                                 if !simple {
-                                    b[bucket_of(r.comp)].push(Entry { comp: r.comp, kind: 0, sorted: r.sorted, t: 0, a: r.a, b: r.b });
+                                    b[bucket_of(r.comp)].push(Entry { comp: r.comp, kind: 0, sorted: r.sorted, t: 0, a: r.a, b: r.b, c: 0 });
                                 } else {
                                     evbuf.clear();
                                     decode_events(ev, r.a as usize, r.b as usize, ctx, &mut evbuf);
@@ -2589,7 +2599,7 @@ fn run(
                         out.neg = true;
                         process_person(ctx, p.comp, &evbuf, &clbuf, &mut out);
                         out.neg = false;
-                        b[bucket_of(p.comp)].push(Entry { comp: p.comp, kind: 0, sorted: true, t: 0, a: p.a, b: p.b });
+                        b[bucket_of(p.comp)].push(Entry { comp: p.comp, kind: 0, sorted: true, t: 0, a: p.a, b: p.b, c: 0 });
                     }
                     (out, b)
                 })
@@ -2615,7 +2625,7 @@ fn run(
                     for j in lo..hi {
                         if consumed[j].load(Relaxed) == 0 {
                             let c = cr_all[j];
-                            b[bucket_of(c.comp)].push(Entry { comp: c.comp, kind: 1, sorted: true, t: 0, a: c.a, b: c.b });
+                            b[bucket_of(c.comp)].push(Entry { comp: c.comp, kind: 1, sorted: true, t: 0, a: c.a, b: c.b, c: 0 });
                         }
                     }
                     b
@@ -2683,9 +2693,8 @@ fn run(
                                     }
                                     2 => {
                                         nruns += 2;
-                                        let (tt, ii) = gev_kept[e.t as usize][e.a as usize];
-                                        let ge = &outs[tt as usize].gev[e.t as usize][ii as usize];
-                                        evbuf.push(Ev { ts: ge.ts, price: ge.price, cat: ge.cat, purchase: ge.purchase });
+                                        let ts = (e.a as u64 | ((e.b as u64) << 32)) as i64;
+                                        evbuf.push(Ev { ts, price: e.c, cat: e.t, purchase: e.sorted });
                                     }
                                     _ => {}
                                 }
